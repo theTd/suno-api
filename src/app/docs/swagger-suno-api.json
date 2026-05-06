@@ -277,6 +277,79 @@
         }
       }
     },
+    "/api/generate_sound": {
+      "post": {
+        "summary": "Generate sound effects based on Prompt.",
+        "description": "Generate short sound effects, loops, and one-shots based on a text description.\n\n2 audio files will be generated for each request, consuming a total of 10 credits.\n\n`wait_audio` can be set to API mode:\n\n• By default, it is set to `false`, which indicates the background mode. It will only return audio task information, and you will need to call the get API to retrieve detailed audio information.\n\n• If set to `true`, it simulates synchronous mode. The API will wait for a maximum of 100s until the audio is generated, and will directly return the audio link and other information. Recommend using in GPTs and other agents.",
+        "tags": ["default"],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["prompt"],
+                "properties": {
+                  "prompt": {
+                    "type": "string",
+                    "description": "Prompt describing the sound effect",
+                    "example": "A futuristic laser gun shooting sound effect"
+                  },
+                  "loop": {
+                    "type": "boolean",
+                    "description": "Whether to generate a looping sound effect",
+                    "example": false
+                  },
+                  "model": {
+                    "type": "string",
+                    "description": "Model name, default is chirp-fenix",
+                    "example": "chirp-fenix"
+                  },
+                  "tempo": {
+                    "type": "number",
+                    "description": "BPM of the generated sound effect",
+                    "example": 120
+                  },
+                  "key": {
+                    "type": "string",
+                    "description": "Musical key of the generated sound effect",
+                    "example": "C"
+                  },
+                  "wait_audio": {
+                    "type": "boolean",
+                    "description": "Whether to wait for audio generation, default is false, directly return audio task information; set to true, will wait for up to 100s until the audio is generated.",
+                    "example": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["0", "1"],
+                    "properties": [
+                      {
+                        "$ref": "#/components/schemas/audio_info"
+                      },
+                      {
+                        "$ref": "#/components/schemas/audio_info"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/generate_lyrics": {
       "post": {
         "summary": "Generate lyrics based on Prompt.",

@@ -11,6 +11,17 @@ export async function POST(req: NextRequest) {
     try {
       const body = await req.json();
       const { prompt, tags, title, make_instrumental, model, wait_audio, negative_tags } = body;
+
+      if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
+        return new NextResponse(JSON.stringify({ error: 'Prompt is required' }), {
+          status: 400,
+          headers: {
+            'Content-Type': 'application/json',
+            ...corsHeaders
+          }
+        });
+      }
+
       const audioInfo = await (await sunoApi((await cookies()).toString())).custom_generate(
         prompt, tags, title,
         Boolean(make_instrumental),

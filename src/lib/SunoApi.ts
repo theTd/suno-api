@@ -18,7 +18,7 @@ const cache = globalForSunoApi.sunoApiCache || new Map<string, SunoApi>();
 globalForSunoApi.sunoApiCache = cache;
 
 const logger = pino();
-export const DEFAULT_MODEL = 'chirp-v3-5';
+export const DEFAULT_MODEL = 'chirp-fenix';
 
 export interface AudioInfo {
   id: string; // Unique identifier for the audio
@@ -68,7 +68,7 @@ interface PersonaResponse {
 }
 
 class SunoApi {
-  private static BASE_URL: string = 'https://studio-api.prod.suno.com';
+  private static BASE_URL: string = 'https://studio-api-prod.suno.com';
   private static CLERK_BASE_URL: string = 'https://auth.suno.com';
   private static CLERK_VERSION = '5.117.0';
 
@@ -555,24 +555,57 @@ class SunoApi {
     negative_tags?: string,
     task?: string,
     continue_clip_id?: string,
-    continue_at?: number
+    continue_at?: number,
+    sound_loop?: boolean,
+    sound_tempo?: number,
+    sound_key?: string
   ): Promise<AudioInfo[]> {
     await this.keepAlive();
     const payload: any = {
-      make_instrumental: make_instrumental,
+      token: await this.getCaptcha(),
+      generation_type: 'TEXT',
       mv: model || DEFAULT_MODEL,
       prompt: '',
-      generation_type: 'TEXT',
-      continue_at: continue_at,
-      continue_clip_id: continue_clip_id,
-      task: task,
-      token: await this.getCaptcha()
+      gpt_description_prompt: '',
+      make_instrumental: make_instrumental ?? false,
+      user_uploaded_images_b64: null,
+      metadata: {
+        web_client_pathname: '/create',
+        is_max_mode: false,
+        is_mumble: false,
+        create_mode: isCustom ? 'custom' : 'simple',
+        disable_volume_normalization: false,
+        lyrics_model: 'default'
+      },
+      override_fields: [],
+      cover_clip_id: null,
+      cover_start_s: null,
+      cover_end_s: null,
+      persona_id: null,
+      artist_clip_id: null,
+      artist_start_s: null,
+      artist_end_s: null,
+      continue_clip_id: continue_clip_id ?? null,
+      continued_aligned_prompt: null,
+      continue_at: continue_at ?? null,
+      task: task ?? null,
+      transaction_uuid: randomUUID()
     };
+    if (task === 'sound') {
+      payload.metadata.sound_configs = { user_loop: sound_loop ?? false };
+      if (sound_tempo !== undefined) {
+        payload.metadata.sound_configs.user_tempo = sound_tempo;
+      }
+      if (sound_key !== undefined && sound_key !== '') {
+        payload.metadata.sound_configs.user_key = sound_key;
+      }
+    }
     if (isCustom) {
       payload.tags = tags;
       payload.title = title;
       payload.negative_tags = negative_tags;
-      payload.prompt = prompt;
+      payload.prompt = task === 'sound' ? '' : prompt;
+      payload.gpt_description_prompt = '';
     } else {
       payload.gpt_description_prompt = prompt;
     }
@@ -594,7 +627,7 @@ class SunoApi {
         )
     );
     const response = await this.client.post(
-      `${SunoApi.BASE_URL}/api/generate/v2/`,
+      `${SunoApi.BASE_URL}/api/generate/v2-web/`,
       payload,
       {
         timeout: 10000 // 10 seconds timeout
@@ -718,6 +751,54 @@ class SunoApi {
     }));
   }
 
+
+  /**
+   * Generate a sound effect based on the prompt.
+   * @param prompt The text prompt to generate the sound effect from.
+   * @param loop Whether the generated sound should be a loop.
+   * @param model The model to use for generation.
+   * @param wait_audio Indicates if the method should wait for the audio file to be fully generated before returning.
+   * @param tempo BPM of the generated sound effect.
+   * @param key Musical key of the generated sound effect.
+   * @returns A promise that resolves to an array of AudioInfo objects representing the generated sound effects.
+   */
+  public async generateSound(
+    prompt: string,
+    loop: boolean = false,
+    model?: string,
+    wait_audio: boolean = false,
+    tempo?: number,
+    key?: string
+  ): Promise<AudioInfo[]> {
+    const startTime = Date.now();
+    // Title is title-cased and truncated to ~100 chars to match official web behavior
+    const title = prompt
+      .split(/\s+/)
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(' ')
+      .slice(0, 100)
+      .replace(/\s+$/, '');
+    const audios = await this.generateSongs(
+      prompt,
+      true,
+      prompt,
+      title,
+      true,
+      model,
+      wait_audio,
+      undefined,
+      'sound',
+      undefined,
+      undefined,
+      loop,
+      tempo,
+      key
+    );
+    const costTime = Date.now() - startTime;
+    logger.info('Generate Sound Response:\n' + JSON.stringify(audios, null, 2));
+    logger.info('Cost time: ' + costTime);
+    return audios;
+  }
 
   /**
    * Get the lyric alignment for a song.

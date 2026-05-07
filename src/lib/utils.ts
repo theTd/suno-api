@@ -1,3 +1,4 @@
+import { NextRequest } from "next/server";
 import pino from "pino";
 import { Page } from "rebrowser-playwright-core";
 
@@ -115,4 +116,23 @@ export const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
+
+/**
+ * Build CORS headers with credentials support.
+ * When req is provided, uses the request's Origin header for Access-Control-Allow-Origin
+ * and sets Access-Control-Allow-Credentials to support cookie-based auth.
+ */
+export function buildCorsHeaders(req?: NextRequest): Record<string, string> {
+  if (!req) {
+    return corsHeaders;
+  }
+  const origin = req.headers.get("origin") ?? "*";
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version",
+    "Access-Control-Allow-Credentials": "true",
+  };
 }
+

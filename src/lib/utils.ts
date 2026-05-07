@@ -38,7 +38,7 @@ export const isPage = (target: any): target is Page => {
  */
 export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> => {
   return new Promise((resolve, reject) => {
-    const urlPattern = /^https:\/\/img[a-zA-Z0-9]*\.hcaptcha\.com\/.*$/;
+    const urlPattern = /^https:\/\/(img[a-zA-Z0-9]*\.hcaptcha\.com|hcaptcha-assets-prod\.suno\.com|hcaptcha-imgs-prod\.suno\.com)\/.*$/;
     let timeoutHandle: NodeJS.Timeout | null = null;
     let activeRequestCount = 0;
     let requestOccurred = false;
@@ -47,6 +47,7 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
       page.off('request', onRequest);
       page.off('requestfinished', onRequestFinished);
       page.off('requestfailed', onRequestFinished);
+      signal.removeEventListener('abort', onAbort);
     };
 
     const resetTimeout = () => {
@@ -66,6 +67,7 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
         activeRequestCount++;
         if (timeoutHandle)
           clearTimeout(timeoutHandle);
+        clearTimeout(initialTimeout);
       }
     };
 
@@ -79,7 +81,6 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
     // Wait for an hCaptcha request for up to 1 minute
     const initialTimeout = setTimeout(() => {
       if (!requestOccurred) {
-        page.off('request', onRequest);
         cleanupListeners();
         reject(new Error('No hCaptcha request occurred within 1 minute.'));
       } else {
@@ -92,19 +93,11 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
     page.on('requestfinished', onRequestFinished);
     page.on('requestfailed', onRequestFinished);
 
-    // Cleanup the initial timeout if an hCaptcha request occurs
-    page.on('request', (request: { url: () => string }) => {
-      if (urlPattern.test(request.url())) {
-        clearTimeout(initialTimeout);
-      }
-    });
-
     const onAbort = () => {
       cleanupListeners();
       clearTimeout(initialTimeout);
       if (timeoutHandle)
         clearTimeout(timeoutHandle);
-      signal.removeEventListener('abort', onAbort);
       reject(new Error('AbortError'));
     };
 

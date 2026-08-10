@@ -4,6 +4,7 @@ import { createMcpServer, sessionCookieStore } from "@/lib/mcp-server-2025";
 import { InMemoryEventStore } from "@/lib/inMemoryEventStore";
 import { buildCorsHeaders } from "@/lib/utils";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import { SUPPORTED_PROTOCOL_VERSIONS as SDK_SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
 import pino from "pino";
 
@@ -14,8 +15,6 @@ const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 export const transports = new Map<string, WebStandardStreamableHTTPServerTransport>();
 
 // ─── Constants ───────────────────────────────────────────────────────
-
-const SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-03-26"];
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -81,7 +80,7 @@ function validateProtocolVersion(req: NextRequest): Response | null {
     // Backwards compatibility: assume 2025-03-26 when absent
     return null;
   }
-  if (!SUPPORTED_PROTOCOL_VERSIONS.includes(version)) {
+  if (!SDK_SUPPORTED_PROTOCOL_VERSIONS.includes(version as (typeof SDK_SUPPORTED_PROTOCOL_VERSIONS)[number])) {
     return jsonRpcError(-32003, `Bad Request: Unsupported MCP-Protocol-Version: ${version}`, 400, req);
   }
   return null;

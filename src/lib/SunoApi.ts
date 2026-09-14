@@ -75,6 +75,7 @@ class SunoApi {
   private readonly client: AxiosInstance;
   private sid?: string;
   private currentToken?: string;
+  private captchaTokenProvider?: string;
   private deviceId?: string;
   private userAgent?: string;
   private cookies: Record<string, string | undefined>;
@@ -304,10 +305,13 @@ class SunoApi {
   }
 
   /**
-   * Checks for CAPTCHA verification and solves the CAPTCHA if needed
-   * @returns {string|null} hCaptcha token. If no verification is required, returns null
+   * Checks for CAPTCHA verification and solves the CAPTCHA if needed.
+   * Suno currently serves Cloudflare Turnstile (captcha_version 2) and may
+   * still fall back to hCaptcha (version 1).
+   * @returns {string|null} Captcha token. If no verification is required, returns null
    */
   public async getCaptcha(): Promise<string|null> {
+    this.captchaTokenProvider = undefined;
     if (!await this.captchaRequired())
       return null;
 
@@ -317,9 +321,11 @@ class SunoApi {
     const timeoutId = setTimeout(() => controller.abort(), 300000);
     let page!: Page;
     let routeHandler: ((route: any) => Promise<void>) | null = null;
+    const generateRoute = /\/api\/generate\/v2/;
 
     try {
       page = await browser.newPage();
+      await this.installTurnstileHook(page);
       await page.goto('https://suno.com/', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
 
       logger.info('Waiting for Suno interface to load');
@@ -329,97 +335,334 @@ class SunoApi {
       } catch {
         // Fallback: some regions/users may not hit this endpoint; continue after delay
       }
-      await sleep(3, 3);
+      // Skeleton textarea is visible before hydration; wait for the logged-in shell.
+      await page.getByRole('link', { name: 'Home' }).waitFor({ timeout: 30000 });
+      await page.locator('textarea').first().waitFor({ state: 'visible', timeout: 15000 });
+      await sleep(1, 1);
 
       if (this.ghostCursorEnabled)
         this.cursor = await createCursor(page);
 
       logger.info('Triggering the CAPTCHA');
-
-      // Dismiss cookie consent banner if present
-      try {
-        const acceptCookies = page.locator('button:has-text("Accept All Cookies")');
-        if (await acceptCookies.count() > 0 && await acceptCookies.first().isVisible({ timeout: 2000 }))
-          await acceptCookies.first().click({ timeout: 2000 });
-      } catch(e: any) {
-        if (e.name !== 'TimeoutError') logger.info('Cookie banner dismiss failed: ' + e.message);
-      }
-
-      // Dismiss any close buttons (cookie banner, app promo, etc.)
-      try {
-        const closeBtn = page.getByLabel('Close');
-        const closeCount = await closeBtn.count();
-        if (closeCount > 0) {
-          for (let i = 0; i < closeCount; i++) {
-            const btn = closeBtn.nth(i);
-            if (await btn.isVisible({ timeout: 2000 })) {
-              await btn.click({ timeout: 2000 });
-              break;
-            }
-          }
-        }
-      } catch(e: any) {
-        if (e.name !== 'TimeoutError') logger.info('Close button click failed: ' + e.message);
-      }
+      await this.dismissOverlays(page);
 
       const textarea = page.locator('textarea').first();
       await this.click(textarea);
-      await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
+      await textarea.fill('Lorem ipsum');
 
       const button = page.locator('button:has-text("Create")').first();
+      await page.waitForFunction(() => {
+        const btn = [...document.querySelectorAll('button')].find((el) =>
+          (el.textContent || '').replace(/\s+/g, ' ').trim() === 'Create'
+        ) as HTMLButtonElement | undefined;
+        return !!btn && !btn.disabled && !btn.hasAttribute('data-disabled');
+      }, { timeout: 20000 });
 
-      // Set up token interception and hCaptcha solving BEFORE clicking Create,
-      // so waitForRequests can catch hCaptcha requests as they happen after navigation
+      let tokenSettled = false;
       const tokenPromise = new Promise<string>((resolve, reject) => {
-        let settled = false;
         const onAbort = () => {
-          if (!settled) { settled = true; reject(new Error('Captcha timeout')); }
+          if (!tokenSettled) { tokenSettled = true; reject(new Error('Captcha timeout')); }
         };
         controller.signal.addEventListener('abort', onAbort, { once: true });
         routeHandler = async (route: any) => {
-          if (settled) { route.continue(); return; }
+          if (tokenSettled) {
+            route.abort();
+            return;
+          }
           try {
             const request = route.request();
-            const postData = request.postDataJSON();
+            let postData: any;
+            try {
+              postData = request.postDataJSON();
+            } catch {
+              route.abort();
+              return;
+            }
             const token = postData?.token;
-            if (!token) { route.continue(); return; }
+            if (!token) {
+              logger.info('Dropping generate request without captcha token');
+              route.abort();
+              return;
+            }
+            if (postData?.token_provider)
+              this.captchaTokenProvider = postData.token_provider;
             this.currentToken = request.headers().authorization?.split('Bearer ').pop();
+            logger.info('Captured generate captcha token from ' + request.url());
             controller.signal.removeEventListener('abort', onAbort);
-            settled = true;
+            tokenSettled = true;
             resolve(token);
             route.abort();
           } catch(err) {
-            if (!settled) { settled = true; controller.signal.removeEventListener('abort', onAbort); reject(err); }
+            route.abort().catch(() => {});
+            logger.warn('Generate intercept error: ' + (err as Error).message);
           }
         };
-        page.route('**/api/generate/v2**', routeHandler);
+        page.route(generateRoute, routeHandler);
       });
-
-      const captchaPromise = this.solveHcaptchaChallenge(page, button, controller.signal);
 
       await this.click(button);
 
       // New Suno UI navigates to /create after clicking Create
       logger.info('Waiting for navigation to /create');
-      await page.waitForURL('**/create**', { timeout: 30000 });
-      logger.info('Navigated to /create');
-
-      // Wait for hCaptcha solving (or no-captcha timeout), then wait for the token.
-      // If no captcha is needed, solveHcaptchaChallenge will timeout and we fall through
-      // to await the already-resolved tokenPromise.
       try {
-        await captchaPromise;
-      } catch (err: any) {
-        logger.warn('CAPTCHA solver failed or no captcha needed: ' + err.message);
+        await page.waitForFunction(() => location.pathname.includes('/create'), { timeout: 30000 });
+        logger.info('Navigated to /create');
+      } catch {
+        logger.warn('Did not navigate to /create, url=' + page.url());
       }
-      const token = await tokenPromise;
-      return token;
+      await this.dismissOverlays(page);
+      await this.triggerCreateOnCreatePage(page);
+
+      const captchaPromise = this.solveDetectedCaptcha(page, button, controller.signal)
+        .then(() => ({ type: 'solved' as const }))
+        .catch((err: any) => ({ type: 'solver_failed' as const, err }));
+      const raced = await Promise.race([
+        tokenPromise.then((token) => ({ type: 'token' as const, token })),
+        captchaPromise,
+      ]);
+      if (raced.type === 'token')
+        return raced.token;
+      if (raced.type === 'solver_failed')
+        logger.warn('CAPTCHA solver error: ' + raced.err?.message);
+      else if (!tokenSettled)
+        await this.triggerCreateOnCreatePage(page);
+      return await tokenPromise;
     } finally {
       clearTimeout(timeoutId);
       controller.abort();
-      if (page && routeHandler) await page.unroute('**/api/generate/v2**', routeHandler);
+      if (page && routeHandler) await page.unroute(generateRoute, routeHandler);
       await browser.close();
     }
+  }
+
+  /**
+   * Capture Turnstile render params (sitekey / callback) before the widget mounts.
+   */
+  private async installTurnstileHook(page: Page): Promise<void> {
+    await page.addInitScript(() => {
+      const w = window as any;
+      const patch = (ts: any) => {
+        if (!ts?.render || ts.__sunoPatched) return ts;
+        ts.__sunoPatched = true;
+        const originalRender = ts.render.bind(ts);
+        ts.render = (container: any, params: any) => {
+          w.__sunoTurnstile = {
+            sitekey: params?.sitekey,
+            action: params?.action,
+            data: params?.cData || params?.data,
+            pagedata: params?.chlPageData,
+            callback: params?.callback,
+          };
+          return originalRender(container, params);
+        };
+        return ts;
+      };
+      if (w.turnstile)
+        patch(w.turnstile);
+      try {
+        let current = w.turnstile;
+        Object.defineProperty(w, 'turnstile', {
+          configurable: true,
+          get() { return current; },
+          set(value) { current = patch(value); },
+        });
+      } catch {
+        const id = window.setInterval(() => {
+          if (w.turnstile) {
+            patch(w.turnstile);
+            window.clearInterval(id);
+          }
+        }, 20);
+      }
+    });
+  }
+
+  /**
+   * If Turnstile is not already on screen, click Create song on /create.
+   * Homepage Create usually submits after routing; this covers the case where
+   * it only navigated and the generate control is still idle.
+   */
+  private async isTurnstileVisible(page: Page): Promise<boolean> {
+    for (const frame of page.frames()) {
+      if (!/challenges\.cloudflare\.com/i.test(frame.url()))
+        continue;
+      try {
+        const box = await (await frame.frameElement()).boundingBox();
+        if (box && box.width > 40 && box.height > 40)
+          return true;
+      } catch {}
+    }
+    return page.getByText('Verify you are human').isVisible().catch(() => false);
+  }
+
+  private async triggerCreateOnCreatePage(page: Page): Promise<void> {
+    if (await this.isTurnstileVisible(page))
+      return;
+    const createSong = page.locator('button[aria-label="Create song"]');
+    try {
+      await createSong.first().waitFor({ state: 'visible', timeout: 20000 });
+    } catch {
+      return;
+    }
+    if (await this.isTurnstileVisible(page))
+      return;
+    if (await createSong.first().isEnabled().catch(() => false)) {
+      logger.info('Clicking Create on /create');
+      await this.click(createSong.first());
+    }
+  }
+
+  private async dismissOverlays(page: Page): Promise<void> {
+    try {
+      const acceptCookies = page.locator('button:has-text("Accept All Cookies")');
+      if (await acceptCookies.count() > 0 && await acceptCookies.first().isVisible({ timeout: 2000 }))
+        await acceptCookies.first().click({ timeout: 2000 });
+    } catch(e: any) {
+      if (e.name !== 'TimeoutError') logger.info('Cookie banner dismiss failed: ' + e.message);
+    }
+    try {
+      const closeBtn = page.getByLabel('Close');
+      const closeCount = await closeBtn.count();
+      if (closeCount > 0) {
+        for (let i = 0; i < closeCount; i++) {
+          const btn = closeBtn.nth(i);
+          if (await btn.isVisible({ timeout: 2000 })) {
+            await btn.click({ timeout: 2000 });
+            break;
+          }
+        }
+      }
+    } catch(e: any) {
+      if (e.name !== 'TimeoutError') logger.info('Close button click failed: ' + e.message);
+    }
+  }
+
+  private async solveDetectedCaptcha(
+    page: Page,
+    button: Locator,
+    signal: AbortSignal
+  ): Promise<void> {
+    const kind = await this.waitForCaptchaKind(page, signal);
+    logger.info('Detected CAPTCHA kind: ' + kind);
+    if (kind === 'turnstile')
+      await this.solveTurnstileChallenge(page, signal);
+    else if (kind === 'hcaptcha')
+      await this.solveHcaptchaChallenge(page, button, signal);
+    else
+      throw new Error('CAPTCHA required but no widget appeared');
+  }
+
+  private async waitForCaptchaKind(
+    page: Page,
+    signal: AbortSignal,
+    timeoutMs: number = 60000
+  ): Promise<'turnstile' | 'hcaptcha' | 'none'> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (signal.aborted)
+        throw new Error('AbortError');
+      if (await this.isTurnstileVisible(page))
+        return 'turnstile';
+      const hcaptchaIframe = page.locator('iframe[title*="hCaptcha"]');
+      if (await hcaptchaIframe.count() > 0) {
+        const visible = await hcaptchaIframe.first().isVisible().catch(() => false);
+        if (visible)
+          return 'hcaptcha';
+      }
+      await sleep(0.4, 0.4);
+    }
+    return 'none';
+  }
+
+  private async extractTurnstileParams(page: Page): Promise<{ sitekey: string; action?: string; data?: string; pagedata?: string }> {
+    await page.waitForFunction(() => !!(window as any).__sunoTurnstile?.sitekey, { timeout: 10000 }).catch(() => {});
+    const hooked = await page.evaluate(() => {
+      const params = (window as any).__sunoTurnstile;
+      if (!params?.sitekey) return null;
+      return {
+        sitekey: String(params.sitekey),
+        action: params.action ? String(params.action) : undefined,
+        data: params.data ? String(params.data) : undefined,
+        pagedata: params.pagedata ? String(params.pagedata) : undefined,
+      };
+    });
+    if (hooked?.sitekey)
+      return hooked;
+    throw new Error('Turnstile sitekey not captured from turnstile.render');
+  }
+
+  private turnstileFrame(page: Page) {
+    return page.frames().find((item) => /challenges\.cloudflare\.com/i.test(item.url()));
+  }
+
+  private async solveTurnstileChallenge(page: Page, signal: AbortSignal): Promise<void> {
+    if (signal.aborted)
+      throw new Error('AbortError');
+
+    // Managed widgets sometimes pass after a real click; skip 2Captcha when that happens.
+    const checkboxFrame = this.turnstileFrame(page);
+    if (checkboxFrame) {
+      await checkboxFrame.locator('body').click({ timeout: 3000 }).catch(() => {});
+      await sleep(3, 3);
+      if (!this.turnstileFrame(page)) {
+        logger.info('Turnstile passed after checkbox click');
+        return;
+      }
+    }
+
+    const params = await this.extractTurnstileParams(page);
+    const payload: { pageurl: string; sitekey: string; action?: string; data?: string; pagedata?: string } = {
+      pageurl: page.url(),
+      sitekey: params.sitekey,
+    };
+    if (params.action)
+      payload.action = params.action;
+    if (params.data)
+      payload.data = params.data;
+    if (params.pagedata)
+      payload.pagedata = params.pagedata;
+
+    let result: { data: string } | undefined;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (signal.aborted)
+        throw new Error('AbortError');
+      try {
+        logger.info('Sending Turnstile to 2Captcha, sitekey=' + params.sitekey);
+        result = await this.solver.cloudflareTurnstile(payload);
+        break;
+      } catch (err: any) {
+        logger.info(err.message);
+        if (attempt === 2) throw err;
+        logger.info('Retrying Turnstile...');
+      }
+    }
+    if (!result)
+      throw new Error('Turnstile solver returned no token');
+    if (signal.aborted)
+      throw new Error('AbortError');
+
+    logger.info('Turnstile solved, injecting token');
+    const injected = await page.evaluate((token: string) => {
+      const w = window as any;
+      const nodes = document.querySelectorAll(
+        'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], input[name="g-recaptcha-response"], textarea[name="g-recaptcha-response"]'
+      );
+      nodes.forEach((node) => {
+        const input = node as HTMLInputElement;
+        input.value = token;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      if (typeof w.__sunoTurnstile?.callback === 'function') {
+        w.__sunoTurnstile.callback(token);
+        return 'callback';
+      }
+      return nodes.length ? 'input' : 'none';
+    }, result.data);
+    logger.info('Turnstile inject path: ' + injected);
+    if (injected === 'none')
+      throw new Error('Turnstile callback was not captured; cannot inject token');
+    await sleep(2, 2);
   }
 
   private async solveHcaptchaChallenge(
@@ -637,8 +880,9 @@ class SunoApi {
     sound_key?: string
   ): Promise<AudioInfo[]> {
     await this.keepAlive();
+    const captchaToken = await this.getCaptcha();
     const payload: any = {
-      token: await this.getCaptcha(),
+      token: captchaToken,
       generation_type: 'TEXT',
       mv: model || DEFAULT_MODEL,
       prompt: '',
@@ -667,6 +911,8 @@ class SunoApi {
       task: task ?? null,
       transaction_uuid: randomUUID()
     };
+    if (this.captchaTokenProvider)
+      payload.token_provider = this.captchaTokenProvider;
     if (task === 'sound') {
       payload.metadata.sound_configs = { user_loop: sound_loop ?? false };
       if (sound_tempo !== undefined) {

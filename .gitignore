@@ -42,3 +42,6 @@ CLAUDE.md
 .playwright-mcp/
 .secret/
 .vscode/
+.captcha-verify/
+scripts/verify-captcha-ui*.cjs
+scripts/verify-turnstile.cjs

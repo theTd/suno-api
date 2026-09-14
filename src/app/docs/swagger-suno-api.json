@@ -35,13 +35,46 @@
                   },
                   "model": {
                     "type": "string",
-                    "description": "Model name ,default is chirp-v3-5",
-                    "example": "chirp-v3-5|chirp-v3-0"
+                    "description": "Model name, default is chirp-hawk (v6)",
+                    "example": "chirp-hawk|chirp-hawk-wild|chirp-goose"
                   },
                   "wait_audio": {
                     "type": "boolean",
                     "description": "Whether to wait for music generation, default is false, directly return audio task information; set to true, will wait for up to 100s until the audio is generated.",
                     "example": "false"
+                  },
+                  "weirdness": {
+                    "type": "number",
+                    "description": "Weirdness slider, 0-100 (default 50, which is omitted from the upstream request).",
+                    "example": 80
+                  },
+                  "style_influence": {
+                    "type": "number",
+                    "description": "Style Influence slider, 0-100 (default 50, which is omitted from the upstream request).",
+                    "example": 30
+                  },
+                  "variety": {
+                    "type": "integer",
+                    "description": "Variety slider, integer 0-4 (default 1).",
+                    "example": 3
+                  },
+                  "duration": {
+                    "type": "integer",
+                    "description": "Fixed song length in seconds, 10-360. Omit for the model default length.",
+                    "example": 180
+                  },
+                  "vocal_gender": {
+                    "type": "string",
+                    "enum": ["m", "f"],
+                    "description": "Constrain the vocal gender. Omit to let the model decide."
+                  },
+                  "is_max_mode": {
+                    "type": "boolean",
+                    "description": "Enable Max mode (as on the official Pro client), default false."
+                  },
+                  "use_personalization": {
+                    "type": "boolean",
+                    "description": "Personalize the result with the account's 'My Taste' profile, default false."
                   }
                 }
               }
@@ -155,13 +188,46 @@
                   },
                   "model": {
                     "type": "string",
-                    "description": "Model name ,default is chirp-v3-5",
-                    "example": "chirp-v3-5|chirp-v3-0"
+                    "description": "Model name, default is chirp-hawk (v6)",
+                    "example": "chirp-hawk|chirp-hawk-wild|chirp-goose"
                   },
                   "wait_audio": {
                     "type": "boolean",
                     "description": "Whether to wait for music generation, default is false, directly return audio task information; set to true, will wait for up to 100s until the audio is generated.",
                     "example": "false"
+                  },
+                  "weirdness": {
+                    "type": "number",
+                    "description": "Weirdness slider, 0-100 (default 50, which is omitted from the upstream request).",
+                    "example": 80
+                  },
+                  "style_influence": {
+                    "type": "number",
+                    "description": "Style Influence slider, 0-100 (default 50, which is omitted from the upstream request).",
+                    "example": 30
+                  },
+                  "variety": {
+                    "type": "integer",
+                    "description": "Variety slider, integer 0-4 (default 1).",
+                    "example": 3
+                  },
+                  "duration": {
+                    "type": "integer",
+                    "description": "Fixed song length in seconds, 10-360. Omit for the model default length.",
+                    "example": 180
+                  },
+                  "vocal_gender": {
+                    "type": "string",
+                    "enum": ["m", "f"],
+                    "description": "Constrain the vocal gender. Omit to let the model decide."
+                  },
+                  "is_max_mode": {
+                    "type": "boolean",
+                    "description": "Enable Max mode (as on the official Pro client), default false."
+                  },
+                  "use_personalization": {
+                    "type": "boolean",
+                    "description": "Personalize the result with the account's 'My Taste' profile, default false."
                   }
                 }
               }
@@ -238,8 +304,8 @@
                   },
                   "model": {
                     "type": "string",
-                    "description": "Model name ,default is chirp-v3-5",
-                    "example": "chirp-v3-5|chirp-v3-0"
+                    "description": "Model name, default is chirp-hawk (v6)",
+                    "example": "chirp-hawk|chirp-hawk-wild|chirp-goose"
                   }
                 }
               }
@@ -306,12 +372,12 @@
                   },
                   "tempo": {
                     "type": "number",
-                    "description": "BPM of the generated sound effect",
+                    "description": "BPM of the generated sound effect, integer 1-300. Omit for auto.",
                     "example": 120
                   },
                   "key": {
                     "type": "string",
-                    "description": "Musical key of the generated sound effect",
+                    "description": "Musical key of the generated sound effect, e.g. 'C', 'F#' or 'A#m' (m = minor). Omit for any key.",
                     "example": "C"
                   },
                   "wait_audio": {

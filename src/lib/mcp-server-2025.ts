@@ -5,6 +5,8 @@ import type { ServerRequest, ServerNotification } from "@modelcontextprotocol/sd
 import { InMemoryTaskStore, InMemoryTaskMessageQueue } from "@modelcontextprotocol/sdk/experimental/tasks/stores/in-memory.js";
 import { z } from "zod/v4";
 import { DEFAULT_MODEL, isUnusableAudioUrl, rewriteForbiddenAudioUrls, sunoApi } from "./SunoApi";
+import type { PreviewJobSnapshot } from "./SunoApi";
+import { parseGenerationExtras } from "./generation-options";
 
 type SunoClient = Awaited<ReturnType<typeof sunoApi>>;
 
@@ -51,15 +53,36 @@ async function buildToolResult(
       const readyClips = clips.filter(
         (clip) => clip.id && (clip.status === "complete" || clip.status === "streaming")
       );
-      const harvested = new Map<string, { buffer: Buffer; contentType: string } | { error: string }>();
+      const harvested = new Map<
+        string,
+        { buffer: Buffer; contentType: string } | { job: PreviewJobSnapshot }
+      >();
       if (opts?.embedAudio && opts.api && readyClips.length > 0) {
+        // Non-blocking: return the cached audio when ready, otherwise join the
+        // background harvest and report its live status as text.
         const results = await Promise.all(
           readyClips.map(async (clip) => {
+            const id = String(clip.id);
             try {
-              const audio = await opts.api!.getPreviewAudio(String(clip.id));
-              return [String(clip.id), audio] as const;
+              const cached = await opts.api!.getCachedPreview(id);
+              if (cached) return [id, cached] as const;
+              opts.api!.beginPreviewHarvest(id);
+              return [id, { job: opts.api!.previewJobStatus(id) }] as const;
             } catch (err: any) {
-              return [String(clip.id), { error: err?.message || String(err) }] as const;
+              return [
+                id,
+                {
+                  job: {
+                    state: 'error' as const,
+                    queuePosition: 0,
+                    progressPercent: null,
+                    currentSec: 0,
+                    durationSec: 0,
+                    bytes: 0,
+                    error: err?.message || String(err)
+                  }
+                }
+              ] as const;
             }
           })
         );
@@ -81,11 +104,31 @@ async function buildToolResult(
               text: `Audio for ${clip.id} is ${audio.buffer.length} bytes (${audio.contentType}); too large to embed. Use audio_url if present.`,
             });
           }
-        } else if (audio && "error" in audio) {
+        } else if (audio && "job" in audio) {
+          const job = audio.job;
+          const detail = job.error
+            ? `capture failed: ${job.error}`
+            : job.state === "capturing"
+              ? job.durationSec > 0
+                ? `capturing ${job.progressPercent ?? 0}% (${job.currentSec}s/${job.durationSec}s)`
+                : `capturing (${job.currentSec}s played so far)`
+              : job.state === "queued"
+                ? `queued at position #${job.queuePosition}`
+                : "waiting for clip to be ready";
           content.push({
             type: "text" as const,
-            text: `Audio bytes unavailable for ${clip.id}: ${audio.error}`,
+            text: `Preview for ${clip.id}: ${detail}. Poll ${origin || "<server>"}/api/preview/${clip.id} for the audio.`,
           });
+          const alreadyLinked =
+            typeof clip.audio_url === "string" && clip.audio_url.includes("/api/preview/");
+          if (origin && !alreadyLinked) {
+            content.push({
+              type: "resource_link" as const,
+              uri: `${origin}/api/preview/${clip.id}`,
+              name: clip.title ? `${clip.title}.m4a` : "preview.m4a",
+              description: "Poll for the captured preview audio (MIME type reported when ready)",
+            });
+          }
         }
         if (clip.audio_url && !isUnusableAudioUrl(clip.audio_url)) {
           content.push({
@@ -141,6 +184,13 @@ const GENERATION_ANNOTATIONS = {
   idempotentHint: false,
 } as const;
 
+// ─── Shared Extras Helper ────────────────────────────────────────────
+
+/** Builds GenerationExtras from validated tool args (zod already type-checked them). */
+function extrasFromArgs(args: Record<string, unknown>) {
+  return parseGenerationExtras(args);
+}
+
 // ─── Generation Runner (shared by sync + task tools) ─────────────────
 
 async function runGenerationTool(
@@ -159,7 +209,9 @@ async function runGenerationTool(
           String(args.prompt),
           Boolean(args.make_instrumental),
           args.model ? String(args.model) : DEFAULT_MODEL,
-          Boolean(args.wait_audio)
+          Boolean(args.wait_audio),
+          undefined,
+          extrasFromArgs(args)
         );
         break;
       case "generate_custom_music":
@@ -170,7 +222,9 @@ async function runGenerationTool(
           Boolean(args.make_instrumental),
           args.model ? String(args.model) : DEFAULT_MODEL,
           Boolean(args.wait_audio),
-          args.negative_tags ? String(args.negative_tags) : undefined
+          args.negative_tags ? String(args.negative_tags) : undefined,
+          undefined,
+          extrasFromArgs(args)
         );
         break;
       case "extend_audio":
@@ -259,11 +313,32 @@ function registerTaskTool(
 
 // ─── Schema Constants (reused by sync + task tools) ──────────────────
 
+const MODEL_DESCRIPTION =
+  "Model name to use for generation: 'chirp-hawk' (v6, default), 'chirp-hawk-wild' (v6-wild), 'chirp-goose' (v6-mini), or a custom model id";
+
+const EXTRAS_SCHEMA_FIELDS = {
+  weirdness: z.number().min(0).max(100).optional()
+    .describe("Weirdness slider, 0-100 (default 50 = omitted from the request)"),
+  style_influence: z.number().min(0).max(100).optional()
+    .describe("Style Influence slider, 0-100 (default 50 = omitted from the request)"),
+  variety: z.number().int().min(0).max(4).optional()
+    .describe("Variety slider, integer 0-4 (default 1)"),
+  duration: z.number().int().min(10).max(360).optional()
+    .describe("Fixed song length in seconds, 10-360. Omit for the model default length."),
+  vocal_gender: z.enum(["m", "f"]).optional()
+    .describe("Constrain the vocal gender. Omit to let the model decide."),
+  is_max_mode: z.boolean().optional()
+    .describe("Enable Max mode (as on the official Pro client)"),
+  use_personalization: z.boolean().optional()
+    .describe("Personalize the result with the account's 'My Taste' profile"),
+} as const;
+
 const GENERATE_MUSIC_SCHEMA = {
   prompt: z.string().describe("Text description of the music to generate"),
   make_instrumental: z.boolean().optional().describe("Whether the generated audio should be instrumental only"),
-  model: z.string().optional().describe("Model name to use for generation (default: chirp-hawk)"),
+  model: z.string().optional().describe(MODEL_DESCRIPTION),
   wait_audio: z.boolean().optional().describe("If true, blocks until audio generation is complete (up to ~100s)"),
+  ...EXTRAS_SCHEMA_FIELDS,
 };
 
 const GENERATE_CUSTOM_MUSIC_SCHEMA = {
@@ -271,9 +346,10 @@ const GENERATE_CUSTOM_MUSIC_SCHEMA = {
   tags: z.string().describe("Style tags / genre (e.g., 'pop, upbeat')"),
   title: z.string().describe("Title of the song"),
   make_instrumental: z.boolean().optional().describe("Whether the generated audio should be instrumental only"),
-  model: z.string().optional().describe("Model name to use (default: chirp-hawk)"),
+  model: z.string().optional().describe(MODEL_DESCRIPTION),
   wait_audio: z.boolean().optional().describe("If true, blocks until audio generation is complete (up to ~100s)"),
   negative_tags: z.string().optional().describe("Tags to exclude from generation"),
+  ...EXTRAS_SCHEMA_FIELDS,
 };
 
 const EXTEND_AUDIO_SCHEMA = {
@@ -290,10 +366,10 @@ const EXTEND_AUDIO_SCHEMA = {
 const GENERATE_SOUND_SCHEMA = {
   prompt: z.string().describe("Text description of the sound effect"),
   loop: z.boolean().optional().describe("Whether the sound should loop"),
-  model: z.string().optional().describe("Model name (default: chirp-hawk)"),
+  model: z.string().optional().describe(MODEL_DESCRIPTION),
   wait_audio: z.boolean().default(true).describe("Defaults to true. Wait until clips are ready and embed playable audio bytes (SFX). Set false to return clip ids immediately."),
-  tempo: z.number().optional().describe("BPM of the generated sound effect"),
-  key: z.string().optional().describe("Musical key of the generated sound effect"),
+  tempo: z.number().int().min(1).max(300).optional().describe("BPM of the generated sound effect (1-300). Omit for auto."),
+  key: z.string().regex(/^[A-G]#?m?$/).optional().describe("Musical key, e.g. 'C', 'F#' or 'A#m' (m = minor). Omit for any key."),
 };
 
 // ─── Server Factory ──────────────────────────────────────────────────
@@ -340,7 +416,8 @@ export function createMcpServer(): McpServer {
         Boolean(args.make_instrumental),
         args.model ? String(args.model) : DEFAULT_MODEL,
         Boolean(args.wait_audio),
-        extra.signal
+        extra.signal,
+        extrasFromArgs(args)
       );
       return buildToolResult(result, { api, embedAudio: Boolean(args.wait_audio) });
     }
@@ -367,7 +444,8 @@ export function createMcpServer(): McpServer {
         args.model ? String(args.model) : DEFAULT_MODEL,
         Boolean(args.wait_audio),
         args.negative_tags ? String(args.negative_tags) : undefined,
-        extra.signal
+        extra.signal,
+        extrasFromArgs(args)
       );
       return buildToolResult(result, { api, embedAudio: Boolean(args.wait_audio) });
     }

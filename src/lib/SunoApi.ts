@@ -23,15 +23,48 @@ const logger = pino();
 export const DEFAULT_MODEL = 'chirp-hawk';
 const AUDIO_CACHE_DIR = path.join(os.tmpdir(), 'suno-audio-cache');
 const PREVIEW_CACHE_DIR = path.join(os.tmpdir(), 'suno-preview-cache');
+// How long a background preview job waits for the clip to become ready.
+const PREVIEW_READY_TIMEOUT_MS = 10 * 60 * 1000;
+// Hard cap for a single in-browser capture (full-song playback + slack).
+const PREVIEW_CAPTURE_MAX_MS = 12 * 60 * 1000;
+// Keep a failed job visible to status pollers before allowing a retry.
+const PREVIEW_ERROR_TTL_MS = 30 * 1000;
+// Fire a background preview harvest right after generation when the audio_url is not directly usable.
+const PREVIEW_PREHARVEST_ENABLED = yn(process.env.SUNO_PREVIEW_PREHARVEST) ?? true;
+
+export type PreviewJobPhase = 'waiting_clip' | 'queued' | 'capturing' | 'error';
+
+export interface PreviewJobSnapshot {
+  state: PreviewJobPhase;
+  /** 1-based position in the browser-harvest wait list; 0 when not queued. */
+  queuePosition: number;
+  /** 0-100 while capturing; null otherwise. */
+  progressPercent: number | null;
+  currentSec: number;
+  durationSec: number;
+  bytes: number;
+  error: string | null;
+}
+
+interface PreviewJob {
+  promise: Promise<Buffer>;
+  phase: PreviewJobPhase;
+  error?: string;
+  currentSec: number;
+  durationSec: number;
+  bytes: number;
+}
+
 const globalForHarvest = global as unknown as {
   sunoAudioHarvest?: Map<string, Promise<Buffer>>;
-  sunoPreviewHarvest?: Map<string, Promise<Buffer>>;
+  sunoPreviewJobs?: Map<string, PreviewJob>;
   sunoPlaywrightHarvest?: Promise<unknown>;
+  sunoHarvestWaitList?: string[];
 };
 const harvestLocks = globalForHarvest.sunoAudioHarvest || new Map<string, Promise<Buffer>>();
 globalForHarvest.sunoAudioHarvest = harvestLocks;
-const previewLocks = globalForHarvest.sunoPreviewHarvest || new Map<string, Promise<Buffer>>();
-globalForHarvest.sunoPreviewHarvest = previewLocks;
+const previewJobs = globalForHarvest.sunoPreviewJobs || new Map<string, PreviewJob>();
+globalForHarvest.sunoPreviewJobs = previewJobs;
 if (!globalForHarvest.sunoPlaywrightHarvest)
   globalForHarvest.sunoPlaywrightHarvest = Promise.resolve();
 
@@ -108,6 +141,175 @@ export interface AudioInfo {
   error_message?: string; // Error message if any
 }
 
+/**
+ * Optional generation tuning knobs exposed by the official Suno web client
+ * (measured from the /create UI). All fields are optional; when absent the
+ * payload matches the official defaults.
+ */
+export interface GenerationExtras {
+  /** Weirdness slider, UI scale 0-100 (default 50). Sent as weirdness_constraint 0.0-1.0;
+   * omitted from the payload when it equals the default 50. */
+  weirdness?: number;
+  /** Style Influence slider, UI scale 0-100 (default 50). Sent as style_weight 0.0-1.0;
+   * omitted when it equals the default 50. */
+  style_influence?: number;
+  /** Variety slider, integer 0-4 (default 1). Sent as aug_creativity; always present. */
+  variety?: number;
+  /** Fixed song length in seconds, 10-360. Omit for the model default length. */
+  duration?: number;
+  /** Vocal gender constraint. Omit to let the model decide. */
+  vocal_gender?: 'm' | 'f';
+  /** Max mode toggle (Pro feature on the official client). */
+  is_max_mode?: boolean;
+  /** Personalize with "My Taste". Only sent when enabled. */
+  use_personalization?: boolean;
+}
+
+/** Throws a descriptive Error when any GenerationExtras field is out of range. */
+export function validateGenerationExtras(extras: GenerationExtras): void {
+  const checkNumber = (name: string, value: number | undefined, min: number, max: number) => {
+    if (value === undefined) return;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max)
+      throw new Error(`${name} must be a number between ${min} and ${max}`);
+  };
+  checkNumber('weirdness', extras.weirdness, 0, 100);
+  checkNumber('style_influence', extras.style_influence, 0, 100);
+  if (extras.variety !== undefined && (!Number.isInteger(extras.variety) || extras.variety < 0 || extras.variety > 4))
+    throw new Error('variety must be an integer between 0 and 4');
+  if (extras.duration !== undefined && (!Number.isInteger(extras.duration) || extras.duration < 10 || extras.duration > 360))
+    throw new Error('duration must be an integer between 10 and 360');
+  if (extras.vocal_gender !== undefined && extras.vocal_gender !== 'm' && extras.vocal_gender !== 'f')
+    throw new Error("vocal_gender must be 'm' or 'f'");
+}
+
+/** Internal options for one generate/v2-web call. */
+export interface GenerateSongsOptions {
+  prompt: string;
+  isCustom: boolean;
+  tags?: string;
+  title?: string;
+  make_instrumental?: boolean;
+  model?: string;
+  wait_audio?: boolean;
+  negative_tags?: string;
+  task?: string;
+  continue_clip_id?: string;
+  continue_at?: number;
+  sound_loop?: boolean;
+  sound_tempo?: number;
+  sound_key?: string;
+  extras?: GenerationExtras;
+  signal?: AbortSignal;
+}
+
+/** Context values resolved by the SunoApi instance at request time. */
+export interface GeneratePayloadContext {
+  captchaToken: string | null;
+  captchaTokenProvider?: string;
+  /** plan id from the Clerk session JWT (without the ':interval' suffix). */
+  userTier?: string;
+  /** Stable per-instance UUID mimicking the web client's create_session_token. */
+  createSessionToken: string;
+}
+
+/**
+ * Extracts the plan id (user_tier) from a Clerk session JWT's `plan` claim.
+ * Returns undefined when the token is missing or undecodable.
+ */
+export function extractUserTierFromJwt(token?: string): string | undefined {
+  if (!token) return undefined;
+  try {
+    const parts = token.split('.');
+    if (parts.length < 2) return undefined;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    const plan = payload?.plan;
+    if (typeof plan !== 'string' || plan.length === 0) return undefined;
+    return plan.split(':')[0];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Builds the official POST /api/generate/v2-web/ request body.
+ * Pure function; every rule here was measured from the Suno web client.
+ */
+export function buildGenerateV2Payload(options: GenerateSongsOptions, ctx: GeneratePayloadContext): any {
+  const extras = options.extras || {};
+  validateGenerationExtras(extras);
+
+  const isSound = options.task === 'sound';
+  const controlSliders: Record<string, number> = {
+    aug_creativity: extras.variety ?? 1
+  };
+  if (extras.weirdness !== undefined && extras.weirdness !== 50)
+    controlSliders.weirdness_constraint = extras.weirdness / 100;
+  if (extras.style_influence !== undefined && extras.style_influence !== 50)
+    controlSliders.style_weight = extras.style_influence / 100;
+
+  const payload: any = {
+    token: ctx.captchaToken ?? null,
+    generation_type: 'TEXT',
+    mv: options.model || DEFAULT_MODEL,
+    prompt: '',
+    gpt_description_prompt: '',
+    make_instrumental: options.make_instrumental ?? false,
+    user_uploaded_images_b64: null,
+    metadata: {
+      web_client_pathname: '/create',
+      create_surface: 'desktop_create_form',
+      is_max_mode: extras.is_max_mode ?? false,
+      is_mumble: false,
+      create_mode: options.isCustom ? 'custom' : 'simple',
+      disable_volume_normalization: false,
+      control_sliders: controlSliders,
+      lyrics_model: 'default'
+    },
+    override_fields: [],
+    cover_clip_id: null,
+    cover_start_s: null,
+    cover_end_s: null,
+    persona_id: null,
+    artist_clip_id: null,
+    artist_start_s: null,
+    artist_end_s: null,
+    continue_clip_id: options.continue_clip_id ?? null,
+    continued_aligned_prompt: null,
+    continue_at: options.continue_at ?? null,
+    transaction_uuid: randomUUID(),
+    token_provider: ctx.captchaTokenProvider ?? null
+  };
+  // The official client only sends `task` for non-custom generations.
+  if (options.task)
+    payload.task = options.task;
+  if (ctx.userTier)
+    payload.metadata.user_tier = ctx.userTier;
+  payload.metadata.create_session_token = ctx.createSessionToken;
+  if (extras.duration !== undefined)
+    payload.duration = Math.round(extras.duration);
+  if (extras.vocal_gender)
+    payload.metadata.vocal_gender = extras.vocal_gender;
+  if (extras.use_personalization)
+    payload.use_personalization = true;
+  if (isSound) {
+    payload.metadata.sound_configs = { user_loop: options.sound_loop ?? false };
+    if (options.sound_tempo !== undefined)
+      payload.metadata.sound_configs.user_tempo = options.sound_tempo;
+    if (options.sound_key)
+      payload.metadata.sound_configs.user_key = options.sound_key;
+  }
+  if (options.isCustom) {
+    payload.tags = options.tags;
+    payload.title = options.title;
+    payload.negative_tags = options.negative_tags ?? '';
+    payload.prompt = isSound ? '' : options.prompt;
+    payload.gpt_description_prompt = '';
+  } else {
+    payload.gpt_description_prompt = options.prompt;
+  }
+  return payload;
+}
+
 interface PersonaResponse {
   persona: {
     id: string;
@@ -145,6 +347,7 @@ class SunoApi {
   private sid?: string;
   private currentToken?: string;
   private captchaTokenProvider?: string;
+  private createSessionToken?: string;
   private deviceId?: string;
   private userAgent?: string;
   private cookies: Record<string, string | undefined>;
@@ -929,27 +1132,21 @@ class SunoApi {
     make_instrumental: boolean = false,
     model?: string,
     wait_audio: boolean = false,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    extras?: GenerationExtras
   ): Promise<AudioInfo[]> {
     await this.keepAlive(false);
     const startTime = Date.now();
-    const audios = await this.generateSongs(
+    const audios = await this.generateSongs({
       prompt,
-      false,
-      undefined,
-      undefined,
+      isCustom: false,
       make_instrumental,
       model,
       wait_audio,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+      task: 'agentic_thinking',
+      extras,
       signal
-    );
+    });
     const costTime = Date.now() - startTime;
     logger.info('Generate Response:\n' + JSON.stringify(audios, null, 2));
     logger.info('Cost time: ' + costTime);
@@ -976,6 +1173,13 @@ class SunoApi {
     if (response.status !== 200) {
       throw new Error('Error response:' + response.statusText);
     }
+    if (PREVIEW_PREHARVEST_ENABLED && response.data) {
+      const produced = Array.isArray(response.data) ? response.data : [response.data];
+      for (const clip of produced) {
+        if (clip?.id && isUnusableAudioUrl(clip.audio_url))
+          this.beginPreviewHarvest(String(clip.id));
+      }
+    }
     return response.data;
   }
 
@@ -998,26 +1202,22 @@ class SunoApi {
     model?: string,
     wait_audio: boolean = false,
     negative_tags?: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    extras?: GenerationExtras
   ): Promise<AudioInfo[]> {
     const startTime = Date.now();
-    const audios = await this.generateSongs(
+    const audios = await this.generateSongs({
       prompt,
-      true,
+      isCustom: true,
       tags,
       title,
       make_instrumental,
       model,
       wait_audio,
       negative_tags,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+      extras,
       signal
-    );
+    });
     const costTime = Date.now() - startTime;
     logger.info(
       'Custom Generate Response:\n' + JSON.stringify(audios, null, 2)
@@ -1027,36 +1227,10 @@ class SunoApi {
   }
 
   /**
-   * Generates songs based on the provided parameters.
-   *
-   * @param prompt The text prompt to generate songs from.
-   * @param isCustom Indicates if the generation should consider custom parameters like tags and title.
-   * @param tags Optional tags to categorize the song, used only if isCustom is true.
-   * @param title Optional title for the song, used only if isCustom is true.
-   * @param make_instrumental Indicates if the generated song should be instrumental.
-   * @param wait_audio Indicates if the method should wait for the audio file to be fully generated before returning.
-   * @param negative_tags Negative tags that should not be included in the generated audio.
-   * @param task Optional indication of what to do. Enter 'extend' if extending an audio, otherwise specify null.
-   * @param continue_clip_id 
+   * Generates songs based on the provided options.
    * @returns A promise that resolves to an array of AudioInfo objects representing the generated songs.
    */
-  private async generateSongs(
-    prompt: string,
-    isCustom: boolean,
-    tags?: string,
-    title?: string,
-    make_instrumental?: boolean,
-    model?: string,
-    wait_audio: boolean = false,
-    negative_tags?: string,
-    task?: string,
-    continue_clip_id?: string,
-    continue_at?: number,
-    sound_loop?: boolean,
-    sound_tempo?: number,
-    sound_key?: string,
-    signal?: AbortSignal
-  ): Promise<AudioInfo[]> {
+  private async generateSongs(options: GenerateSongsOptions): Promise<AudioInfo[]> {
     // The gated section is kept short on purpose: keepAlive + captcha
     // acquisition + the generate POST. The wait_audio polling runs outside the
     // gate so queued requests are only blocked by the solver's submission, not
@@ -1064,34 +1238,28 @@ class SunoApi {
     const clips = await this.captchaGate.run(async (engage) => {
       try {
         await this.keepAlive();
-        const captchaToken = await this.getCaptcha(engage, signal);
-        return await this.postGenerate(
-          prompt,
-          isCustom,
-          tags,
-          title,
-          make_instrumental,
-          model,
-          negative_tags,
-          task,
-          continue_clip_id,
-          continue_at,
-          sound_loop,
-          sound_tempo,
-          sound_key,
-          captchaToken
-        );
+        const captchaToken = await this.getCaptcha(engage, options.signal);
+        return await this.postGenerate({ ...options, captchaToken });
       } catch (e) {
         // A disconnected client must not fail the queued backlog: map any
         // in-flight failure to ClientGoneError so the gate treats it neutrally.
-        if (signal?.aborted)
+        if (options.signal?.aborted)
           throw new ClientGoneError();
         throw e;
       }
-    }, signal);
+    }, options.signal);
+    const waitAudio = options.wait_audio ?? false;
     const songIds = clips.map((audio: any) => audio.id);
+    if (PREVIEW_PREHARVEST_ENABLED) {
+      // Start the preview harvest right away (no unlock / no download credit) so
+      // later API/MCP requests join an already-running job instead of waiting.
+      for (const clip of clips) {
+        if (clip?.id && isUnusableAudioUrl(clip.audio_url))
+          this.beginPreviewHarvest(String(clip.id));
+      }
+    }
     //Want to wait for music file generation
-    if (wait_audio) {
+    if (waitAudio) {
       const startTime = Date.now();
       let lastResponse: AudioInfo[] = [];
       await sleep(5, 5);
@@ -1130,81 +1298,25 @@ class SunoApi {
   }
 
   private async postGenerate(
-    prompt: string,
-    isCustom: boolean,
-    tags?: string,
-    title?: string,
-    make_instrumental?: boolean,
-    model?: string,
-    negative_tags?: string,
-    task?: string,
-    continue_clip_id?: string,
-    continue_at?: number,
-    sound_loop?: boolean,
-    sound_tempo?: number,
-    sound_key?: string,
-    captchaToken: string | null = null
+    options: GenerateSongsOptions & { captchaToken: string | null }
   ): Promise<any[]> {
-    const payload: any = {
-      token: captchaToken,
-      generation_type: 'TEXT',
-      mv: model || DEFAULT_MODEL,
-      prompt: '',
-      gpt_description_prompt: '',
-      make_instrumental: make_instrumental ?? false,
-      user_uploaded_images_b64: null,
-      metadata: {
-        web_client_pathname: '/create',
-        is_max_mode: false,
-        is_mumble: false,
-        create_mode: isCustom ? 'custom' : 'simple',
-        disable_volume_normalization: false,
-        lyrics_model: 'default'
-      },
-      override_fields: [],
-      cover_clip_id: null,
-      cover_start_s: null,
-      cover_end_s: null,
-      persona_id: null,
-      artist_clip_id: null,
-      artist_start_s: null,
-      artist_end_s: null,
-      continue_clip_id: continue_clip_id ?? null,
-      continued_aligned_prompt: null,
-      continue_at: continue_at ?? null,
-      task: task ?? null,
-      transaction_uuid: randomUUID()
-    };
-    if (this.captchaTokenProvider)
-      payload.token_provider = this.captchaTokenProvider;
-    if (task === 'sound') {
-      payload.metadata.sound_configs = { user_loop: sound_loop ?? false };
-      if (sound_tempo !== undefined) {
-        payload.metadata.sound_configs.user_tempo = sound_tempo;
-      }
-      if (sound_key !== undefined && sound_key !== '') {
-        payload.metadata.sound_configs.user_key = sound_key;
-      }
-    }
-    if (isCustom) {
-      payload.tags = tags;
-      payload.title = title;
-      payload.negative_tags = negative_tags;
-      payload.prompt = task === 'sound' ? '' : prompt;
-      payload.gpt_description_prompt = '';
-    } else {
-      payload.gpt_description_prompt = prompt;
-    }
+    const payload = buildGenerateV2Payload(options, {
+      captchaToken: options.captchaToken,
+      captchaTokenProvider: this.captchaTokenProvider,
+      userTier: extractUserTierFromJwt(this.currentToken),
+      createSessionToken: this.createSessionToken ??= randomUUID()
+    });
     logger.info(
       'generateSongs payload:\n' +
         JSON.stringify(
           {
-            prompt: prompt,
-            isCustom: isCustom,
-            tags: tags,
-            title: title,
-            make_instrumental: make_instrumental,
-            negative_tags: negative_tags,
+            prompt: options.prompt,
+            isCustom: options.isCustom,
+            tags: options.tags,
+            title: options.title,
+            make_instrumental: options.make_instrumental,
+            negative_tags: options.negative_tags,
+            extras: options.extras,
             payload: payload
           },
           null,
@@ -1274,7 +1386,20 @@ class SunoApi {
     wait_audio?: boolean,
     signal?: AbortSignal
   ): Promise<AudioInfo[]> {
-    return this.generateSongs(prompt, true, tags, title, false, model, wait_audio, negative_tags, 'extend', audioId, continueAt, undefined, undefined, undefined, signal);
+    return this.generateSongs({
+      prompt,
+      isCustom: true,
+      tags,
+      title,
+      make_instrumental: false,
+      model,
+      wait_audio,
+      negative_tags,
+      task: 'extend',
+      continue_clip_id: audioId,
+      continue_at: continueAt,
+      signal
+    });
   }
 
   /**
@@ -1317,7 +1442,8 @@ class SunoApi {
     wait_audio: boolean = false,
     tempo?: number,
     key?: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    extras?: GenerationExtras
   ): Promise<AudioInfo[]> {
     const startTime = Date.now();
     // Title is title-cased and truncated to ~100 chars to match official web behavior
@@ -1327,23 +1453,21 @@ class SunoApi {
       .join(' ')
       .slice(0, 100)
       .replace(/\s+$/, '');
-    const audios = await this.generateSongs(
+    const audios = await this.generateSongs({
       prompt,
-      true,
-      prompt,
+      isCustom: true,
+      tags: prompt,
       title,
-      true,
+      make_instrumental: true,
       model,
       wait_audio,
-      undefined,
-      'sound',
-      undefined,
-      undefined,
-      loop,
-      tempo,
-      key,
+      task: 'sound',
+      sound_loop: loop,
+      sound_tempo: tempo,
+      sound_key: key,
+      extras,
       signal
-    );
+    });
     const costTime = Date.now() - startTime;
     logger.info('Generate Sound Response:\n' + JSON.stringify(audios, null, 2));
     logger.info('Cost time: ' + costTime);
@@ -1488,23 +1612,79 @@ class SunoApi {
   /**
    * Capture the in-player preview (no Premier unlock / no download credit).
    * Hooks MSE appendBuffer while the Studio page plays the clip.
+   * Backwards-compatible blocking join: cached → buffer, otherwise waits for
+   * the (possibly already running) harvest job to finish.
    */
   public async getPreviewAudio(clipId: string): Promise<{ buffer: Buffer; contentType: string }> {
-    let pending = previewLocks.get(clipId);
-    if (!pending) {
-      pending = (async () => {
-        const cached = await this.readPreviewCache(clipId);
-        if (cached) return cached.buffer;
-        return this.harvestPreviewAudio(clipId);
-      })();
-      previewLocks.set(clipId, pending);
-    }
+    const cached = await this.readPreviewCache(clipId);
+    if (cached) return cached;
+    const job = this.beginPreviewHarvest(clipId);
+    const buffer = await job.promise;
+    return { buffer, contentType: this.sniffAudioType(buffer) };
+  }
+
+  /** Return the cached preview file, or null when not captured yet. */
+  public async getCachedPreview(clipId: string): Promise<{ buffer: Buffer; contentType: string } | null> {
+    return this.readPreviewCache(clipId);
+  }
+
+  /**
+   * Start (or join) the background preview harvest for a clip.
+   * Never blocks and never throws: failures land in the job's error state.
+   */
+  public beginPreviewHarvest(clipId: string): PreviewJob {
+    const existing = previewJobs.get(clipId);
+    if (existing) return existing;
+    const job: PreviewJob = {
+      promise: null as unknown as Promise<Buffer>,
+      phase: 'waiting_clip',
+      currentSec: 0,
+      durationSec: 0,
+      bytes: 0
+    };
+    job.promise = this.runPreviewJob(clipId, job);
+    // Errors are surfaced through previewJobStatus(); never crash the process.
+    job.promise.catch(() => {});
+    previewJobs.set(clipId, job);
+    return job;
+  }
+
+  /** Live status of a running (or recently failed) preview harvest. */
+  public previewJobStatus(clipId: string): PreviewJobSnapshot | null {
+    const job = previewJobs.get(clipId);
+    if (!job) return null;
+    const waitList = globalForHarvest.sunoHarvestWaitList || [];
+    const idx = job.phase === 'queued' ? waitList.indexOf(clipId) : -1;
+    const progressPercent =
+      job.phase === 'capturing' && job.durationSec > 0
+        ? Math.min(100, Math.round((job.currentSec / job.durationSec) * 1000) / 10)
+        : null;
+    return {
+      state: job.phase,
+      queuePosition: idx >= 0 ? idx + 1 : 0,
+      progressPercent,
+      currentSec: Math.round(job.currentSec * 10) / 10,
+      durationSec: Math.round(job.durationSec * 10) / 10,
+      bytes: job.bytes,
+      error: job.error ?? null
+    };
+  }
+
+  private async runPreviewJob(clipId: string, job: PreviewJob): Promise<Buffer> {
     try {
-      const buffer = await pending;
-      return { buffer, contentType: this.sniffAudioType(buffer) };
-    } finally {
-      if (previewLocks.get(clipId) === pending)
-        previewLocks.delete(clipId);
+      const buffer = await this.harvestPreviewAudio(clipId, job);
+      // Success: the cache file is the source of truth now.
+      if (previewJobs.get(clipId) === job) previewJobs.delete(clipId);
+      return buffer;
+    } catch (err: any) {
+      job.phase = 'error';
+      job.error = err?.message || String(err);
+      logger.warn({ clipId, err: job.error }, 'Preview harvest failed');
+      const timer = setTimeout(() => {
+        if (previewJobs.get(clipId) === job) previewJobs.delete(clipId);
+      }, PREVIEW_ERROR_TTL_MS);
+      timer.unref();
+      throw err;
     }
   }
 
@@ -1554,32 +1734,83 @@ class SunoApi {
     await fs.rename(tmp, dest);
   }
 
-  private async harvestPreviewAudio(clipId: string): Promise<Buffer> {
-    let clipStatus: string | undefined;
-    let durationSec: number | undefined;
-    try {
-      const clips = await this.get([clipId]);
-      clipStatus = clips[0]?.status;
-      const rawDuration = Number(clips[0]?.duration);
-      if (Number.isFinite(rawDuration) && rawDuration > 0)
-        durationSec = rawDuration;
-    } catch (err: any) {
-      throw new ClipAudioNotReadyError('Clip status unavailable');
-    }
-    if (clipStatus !== 'complete' && clipStatus !== 'streaming')
-      throw new ClipAudioNotReadyError('Clip is not ready for preview');
-    logger.info('Capturing in-player preview (no unlock): ' + clipId);
-    const previous = globalForHarvest.sunoPlaywrightHarvest || Promise.resolve();
+  /**
+   * Serialize all Playwright harvests (preview captures and master downloads)
+   * through a single global chain. While waiting, the clip id sits in
+   * sunoHarvestWaitList so status pollers can report the queue position.
+   */
+  private async acquireHarvestSlot(clipId: string): Promise<() => void> {
+    const g = globalForHarvest;
+    const waitList = (g.sunoHarvestWaitList ||= []);
+    waitList.push(clipId);
+    const previous = g.sunoPlaywrightHarvest || Promise.resolve();
     let release!: () => void;
-    globalForHarvest.sunoPlaywrightHarvest = new Promise<void>((resolve) => { release = resolve; });
+    g.sunoPlaywrightHarvest = new Promise<void>((resolve) => { release = resolve; });
     await previous.catch(() => {});
+    const idx = waitList.indexOf(clipId);
+    if (idx >= 0) waitList.splice(idx, 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      release();
+    };
+  }
+
+  /** Poll the clip until it can be previewed (complete or streaming). */
+  private async waitForPreviewReady(
+    clipId: string,
+    job: PreviewJob
+  ): Promise<{ status: string; durationSec?: number }> {
+    const deadline = Date.now() + PREVIEW_READY_TIMEOUT_MS;
+    let sawTransientError = false;
+    while (Date.now() < deadline) {
+      try {
+        const clips = await this.get([clipId]);
+        const clip = clips[0];
+        const status = clip?.status;
+        if (status === 'complete' || status === 'streaming') {
+          const rawDuration = Number(clip?.duration);
+          return {
+            status,
+            durationSec: Number.isFinite(rawDuration) && rawDuration > 0 ? rawDuration : undefined
+          };
+        }
+        if (status === 'error')
+          throw new ClipAudioNotReadyError('Clip generation failed');
+        job.phase = 'waiting_clip';
+      } catch (err: any) {
+        if (err instanceof ClipAudioNotReadyError) throw err;
+        sawTransientError = true;
+        logger.warn({ clipId, err: err?.message }, 'Preview readiness poll failed; retrying');
+      }
+      await waitMs(3000);
+      await this.keepAlive(true).catch(() => {});
+    }
+    throw new ClipAudioNotReadyError(
+      sawTransientError ? 'Clip status unavailable' : 'Clip not ready for preview within time limit'
+    );
+  }
+
+  private async harvestPreviewAudio(clipId: string, job: PreviewJob): Promise<Buffer> {
+    const ready = await this.waitForPreviewReady(clipId, job);
+    logger.info('Capturing in-player preview (no unlock): ' + clipId);
+    job.phase = 'queued';
+    const release = await this.acquireHarvestSlot(clipId);
+    job.phase = 'capturing';
     try {
+      const watchdogMs = Math.min(
+        PREVIEW_CAPTURE_MAX_MS,
+        (ready.durationSec ?? 20) * 1000 + 120000
+      );
       const harvested = await this.withBrowserWatchdog(
-        this.capturePreviewViaBrowser(clipId, durationSec),
-        150000,
+        this.capturePreviewViaBrowser(clipId, ready.durationSec, job),
+        watchdogMs,
         'Preview capture'
       );
-      if (clipStatus === 'complete')
+      job.currentSec = job.durationSec || job.currentSec;
+      job.bytes = harvested.length;
+      if (ready.status === 'complete')
         await this.writePreviewCache(clipId, harvested);
       return harvested;
     } finally {
@@ -1587,7 +1818,11 @@ class SunoApi {
     }
   }
 
-  private async capturePreviewViaBrowser(clipId: string, clipDurationSec?: number): Promise<Buffer> {
+  private async capturePreviewViaBrowser(
+    clipId: string,
+    clipDurationSec?: number,
+    job?: PreviewJob
+  ): Promise<Buffer> {
     const { browser, context } = await this.launchBrowser();
     try {
       await context.addInitScript(() => {
@@ -1641,8 +1876,8 @@ class SunoApi {
         await page.keyboard.press('Space').catch(() => {});
       }
 
-      const targetSec = Math.min(clipDurationSec && clipDurationSec > 0 ? clipDurationSec : 20, 20);
-      const deadline = Date.now() + Math.min(90000, targetSec * 1000 + 15000);
+      const targetSec = clipDurationSec && clipDurationSec > 0 ? clipDurationSec : 20;
+      const deadline = Date.now() + Math.min(PREVIEW_CAPTURE_MAX_MS, targetSec * 1000 + 60000);
       let playback: { t: number; d: number; ended: boolean; paused: boolean; bytes: number } | null = null;
       while (Date.now() < deadline) {
         playback = await page.evaluate(() => {
@@ -1657,6 +1892,11 @@ class SunoApi {
             bytes: store?.bytes || 0
           };
         }).catch(() => null);
+        if (playback && job) {
+          job.currentSec = playback.t;
+          if (playback.d > 0) job.durationSec = playback.d;
+          job.bytes = playback.bytes;
+        }
         if (playback && playback.t > 0.2 && playback.paused)
           await page.evaluate(async () => {
             for (const a of document.querySelectorAll('audio, video') as NodeListOf<HTMLMediaElement>) {
@@ -1714,10 +1954,7 @@ class SunoApi {
     }
 
     logger.info('Official clip download unavailable, harvesting via Playwright: ' + clipId);
-    const previous = globalForHarvest.sunoPlaywrightHarvest || Promise.resolve();
-    let release!: () => void;
-    globalForHarvest.sunoPlaywrightHarvest = new Promise<void>((resolve) => { release = resolve; });
-    await previous.catch(() => {});
+    const release = await this.acquireHarvestSlot(clipId);
     try {
       const harvested = await this.withBrowserWatchdog(
         this.downloadClipViaBrowser(clipId),

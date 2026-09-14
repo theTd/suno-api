@@ -1,6 +1,7 @@
 import { NextResponse, NextRequest } from "next/server";
 import { cookies } from 'next/headers'
 import { DEFAULT_MODEL, rewriteForbiddenAudioUrls, sunoApi } from "@/lib/SunoApi";
+import { parseSoundKey, parseSoundTempo } from "@/lib/generation-options";
 import { corsHeaders } from "@/lib/utils";
 import { ClientGoneError } from "@/lib/captcha-gate";
 
@@ -10,7 +11,7 @@ export async function POST(req: NextRequest) {
   if (req.method === 'POST') {
     try {
       const body = await req.json();
-      const { prompt, loop, model, wait_audio, tempo, key } = body;
+      const { prompt, loop, model, wait_audio } = body;
 
       if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
         return new NextResponse(JSON.stringify({ error: 'Prompt is required' }), {
@@ -19,6 +20,17 @@ export async function POST(req: NextRequest) {
             'Content-Type': 'application/json',
             ...corsHeaders
           }
+        });
+      }
+
+      let tempo, key;
+      try {
+        tempo = parseSoundTempo(body.tempo);
+        key = parseSoundKey(body.key);
+      } catch (e: any) {
+        return new NextResponse(JSON.stringify({ error: e.message }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
         });
       }
 

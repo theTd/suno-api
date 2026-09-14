@@ -133,6 +133,22 @@ Suno API 目前主要实现了以下 API:
 详细文档请查看演示站点:
 [suno.gcui.ai/docs](https://suno.gcui.ai/docs)
 
+### 生成调优参数（可选）
+
+`/api/generate` 和 `/api/custom_generate` 额外支持以下可选参数，与 Suno 官方网页版的控制项一一对应：
+
+| 参数 | 类型 | 取值范围 | 说明 |
+|---|---|---|---|
+| `weirdness` | number | 0-100（默认 50） | Weirdness 滑块；上游字段 `weirdness_constraint`（0.0-1.0），为 50 时不发送 |
+| `style_influence` | number | 0-100（默认 50） | Style Influence 滑块；上游字段 `style_weight`（0.0-1.0），为 50 时不发送 |
+| `variety` | integer | 0-4（默认 1） | Variety 滑块（上游字段 `aug_creativity`） |
+| `duration` | integer | 10-360 秒 | 固定歌曲时长；不传则使用模型默认长度 |
+| `vocal_gender` | string | `m` / `f` | 约束演唱者性别；不传则由模型决定 |
+| `is_max_mode` | boolean | 默认 `false` | Max 模式（同官方 Pro 客户端） |
+| `use_personalization` | boolean | 默认 `false` | 使用账号的 "My Taste" 画像做个性化 |
+
+`/api/generate_sound` 支持 `tempo`（整数 BPM 1-300，不传为自动）和 `key`（如 `C`、`F#`、`A#m`，后缀 `m` 表示小调，不传为任意调）。
+
 ## API 集成代码示例
 
 ### Python

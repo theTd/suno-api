@@ -166,6 +166,22 @@ Suno API currently mainly implements the following APIs:
 
 You can also specify the cookies in the `Cookie` header of your request, overriding the default cookies in the `SUNO_COOKIE` environment variable. This comes in handy when, for example, you want to use multiple free accounts at the same time.
 
+### Generation tuning parameters (optional)
+
+`/api/generate` and `/api/custom_generate` additionally accept these optional fields, matching the official Suno web client's controls:
+
+| Field | Type | Range / Values | Description |
+|---|---|---|---|
+| `weirdness` | number | 0-100 (default 50) | Weirdness slider; sent upstream as `weirdness_constraint` 0.0-1.0, omitted when 50 |
+| `style_influence` | number | 0-100 (default 50) | Style Influence slider; sent upstream as `style_weight` 0.0-1.0, omitted when 50 |
+| `variety` | integer | 0-4 (default 1) | Variety slider (`aug_creativity`) |
+| `duration` | integer | 10-360 seconds | Fixed song length; omit for the model default |
+| `vocal_gender` | string | `m` / `f` | Constrain the vocal gender; omit to let the model decide |
+| `is_max_mode` | boolean | default `false` | Max mode (as on the official Pro client) |
+| `use_personalization` | boolean | default `false` | Personalize with the account's "My Taste" profile |
+
+`/api/generate_sound` accepts `tempo` (integer BPM 1-300, omit for auto) and `key` (e.g. `C`, `F#`, `A#m`; `m` = minor, omit for any key).
+
 For more detailed documentation, please check out the demo site:
 [suno.gcui.ai/docs](https://suno.gcui.ai/docs)
 

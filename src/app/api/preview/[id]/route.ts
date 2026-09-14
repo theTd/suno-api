@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
-import { ClipAudioNotReadyError, sunoApi } from '@/lib/SunoApi';
+import { sunoApi } from '@/lib/SunoApi';
 import { corsHeaders } from '@/lib/utils';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 120;
 
 const CLIP_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -19,34 +18,47 @@ export async function GET(
 
   try {
     const cookie = (await cookies()).toString();
-    const { buffer, contentType } = await (await sunoApi(cookie)).getPreviewAudio(clipId);
-    const ext = contentType.includes('webm')
-      ? 'webm'
-      : contentType.includes('wav')
-        ? 'wav'
-        : contentType.includes('mp4')
-          ? 'm4a'
-          : 'mp3';
-    return new NextResponse(Uint8Array.from(buffer), {
-      status: 200,
-      headers: {
-        'Content-Type': contentType,
-        'Content-Length': String(buffer.length),
-        'Content-Disposition': `inline; filename="${clipId}-preview.${ext}"`,
-        'Cache-Control': 'private, max-age=60',
-        ...corsHeaders
-      }
-    });
-  } catch (error: any) {
-    console.error('Error capturing preview audio:', error?.message || error);
-    if (error instanceof ClipAudioNotReadyError) {
+    const api = await sunoApi(cookie);
+
+    // Already captured: stream the binary straight away.
+    const cached = await api.getCachedPreview(clipId);
+    if (cached) {
+      const ext = cached.contentType.includes('webm')
+        ? 'webm'
+        : cached.contentType.includes('wav')
+          ? 'wav'
+          : cached.contentType.includes('mp4')
+            ? 'm4a'
+            : 'mp3';
+      return new NextResponse(Uint8Array.from(cached.buffer), {
+        status: 200,
+        headers: {
+          'Content-Type': cached.contentType,
+          'Content-Length': String(cached.buffer.length),
+          'Content-Disposition': `inline; filename="${clipId}-preview.${ext}"`,
+          'Cache-Control': 'private, max-age=60',
+          ...corsHeaders
+        }
+      });
+    }
+
+    // Not captured yet: join (or start) the background harvest and report status.
+    api.beginPreviewHarvest(clipId);
+    const status = api.previewJobStatus(clipId);
+    if (status?.state === 'error') {
       return NextResponse.json(
-        { error: error.message },
-        { status: 409, headers: { ...corsHeaders, 'Retry-After': '5' } }
+        { id: clipId, ...status, retry_after: 30 },
+        { status: 502, headers: { ...corsHeaders, 'Retry-After': '30' } }
       );
     }
     return NextResponse.json(
-      { error: error?.message || 'Failed to capture preview audio' },
+      { id: clipId, ...status, retry_after: 5 },
+      { status: 202, headers: { ...corsHeaders, 'Retry-After': '5' } }
+    );
+  } catch (error: any) {
+    console.error('Error starting preview capture:', error?.message || error);
+    return NextResponse.json(
+      { error: error?.message || 'Failed to start preview capture' },
       { status: 502, headers: corsHeaders }
     );
   }

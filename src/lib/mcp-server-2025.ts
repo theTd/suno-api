@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ServerRequest, ServerNotification } from "@modelcontextprotocol/sdk/types.js";
@@ -117,16 +117,16 @@ async function buildToolResult(
                 : "waiting for clip to be ready";
           content.push({
             type: "text" as const,
-            text: `Preview for ${clip.id}: ${detail}. Poll ${origin || "<server>"}/api/preview/${clip.id} for the audio.`,
+            text: `Preview for ${clip.id}: ${detail}. Stream ${origin || "<server>"}/api/preview/${clip.id}?stream=1 to listen while the capture is still running, or poll the same URL without ?stream=1 for status.`,
           });
           const alreadyLinked =
             typeof clip.audio_url === "string" && clip.audio_url.includes("/api/preview/");
           if (origin && !alreadyLinked) {
             content.push({
               type: "resource_link" as const,
-              uri: `${origin}/api/preview/${clip.id}`,
-              name: clip.title ? `${clip.title}.m4a` : "preview.m4a",
-              description: "Poll for the captured preview audio (MIME type reported when ready)",
+              uri: `${origin}/api/preview/${clip.id}?stream=1`,
+              name: clip.title ? `${clip.title}.webm` : "preview.webm",
+              description: "Progressive audio stream (chunked) — starts playing before the capture finishes",
             });
           }
         }
@@ -667,6 +667,43 @@ export function createMcpServer(): McpServer {
       const api = await sunoApi(cookies);
       const result = await api.getLyricAlignment(String(args.song_id));
       return buildToolResult(result);
+    }
+  );
+
+  // ─── Streaming Preview Resource (protocol layer) ───────────────────
+  // MCP resources themselves return complete content, so a live capture is
+  // exposed as a reference: reading this resource reports the harvest status
+  // and the progressive HTTP stream URL, which serves chunked audio while
+  // the capture is still running (and replays instantly from cache later).
+  server.registerResource(
+    "preview_stream",
+    new ResourceTemplate("suno://preview/{clip_id}", { list: undefined }),
+    {
+      title: "Streaming Preview",
+      description:
+        "Progressively stream a clip's in-player preview: open the returned stream_url for chunked audio that plays while the capture is still running. No unlock / no download credit.",
+    },
+    async (uri, variables) => {
+      const clipId = Array.isArray(variables.clip_id)
+        ? variables.clip_id[0]
+        : variables.clip_id;
+      if (!clipId) {
+        return { contents: [{ uri: uri.href, text: "Missing clip_id in suno://preview/{clip_id}" }] };
+      }
+      const api = await sunoApi(getSessionCookies(undefined));
+      const origin = (process.env.SUNO_PUBLIC_BASE_URL || "").replace(/\/$/, "");
+      const status = api.previewJobStatus(clipId);
+      const text = JSON.stringify(
+        {
+          clip_id: clipId,
+          harvest: status ?? "not started (starts on first stream request)",
+          stream_url: origin ? `${origin}/api/preview/${clipId}?stream=1` : null,
+          note: "GET stream_url for a chunked progressive audio stream (Content-Type sniffed from the first captured chunk). Omit ?stream=1 to poll status instead.",
+        },
+        null,
+        2
+      );
+      return { contents: [{ uri: uri.href, text }] };
     }
   );
 

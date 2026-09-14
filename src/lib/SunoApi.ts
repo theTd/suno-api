@@ -11,6 +11,7 @@ import { paramsCoordinates } from '@2captcha/captcha-solver/dist/structs/2captch
 import { Browser, BrowserContext, Page, Locator, chromium, firefox } from 'rebrowser-playwright-core';
 import { createCursor, Cursor } from 'ghost-cursor-playwright';
 import { promises as fs } from 'fs';
+import { Readable } from 'stream';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -29,6 +30,11 @@ const PREVIEW_READY_TIMEOUT_MS = 10 * 60 * 1000;
 const PREVIEW_CAPTURE_MAX_MS = 12 * 60 * 1000;
 // Keep a failed job visible to status pollers before allowing a retry.
 const PREVIEW_ERROR_TTL_MS = 30 * 1000;
+// Keep a successfully captured preview in memory so reconnecting stream
+// clients replay it instead of re-running a full browser capture. Only
+// 'complete' clips are written to the on-disk cache; 'streaming' clips live
+// here for this TTL instead.
+const PREVIEW_RESULT_TTL_MS = 10 * 60 * 1000;
 // Fire a background preview harvest right after generation when the audio_url is not directly usable.
 const PREVIEW_PREHARVEST_ENABLED = yn(process.env.SUNO_PREVIEW_PREHARVEST) ?? true;
 
@@ -53,11 +59,16 @@ interface PreviewJob {
   currentSec: number;
   durationSec: number;
   bytes: number;
+  /** Progressive-capture subscribers (protocol-layer streaming). */
+  chunkSubs?: Set<(chunk: Buffer) => void>;
+  endSubs?: Set<() => void>;
+  errSubs?: Set<(err: Error) => void>;
 }
 
 const globalForHarvest = global as unknown as {
   sunoAudioHarvest?: Map<string, Promise<Buffer>>;
   sunoPreviewJobs?: Map<string, PreviewJob>;
+  sunoPreviewResults?: Map<string, { buffer: Buffer; expiresAt: number }>;
   sunoPlaywrightHarvest?: Promise<unknown>;
   sunoHarvestWaitList?: string[];
 };
@@ -65,6 +76,8 @@ const harvestLocks = globalForHarvest.sunoAudioHarvest || new Map<string, Promis
 globalForHarvest.sunoAudioHarvest = harvestLocks;
 const previewJobs = globalForHarvest.sunoPreviewJobs || new Map<string, PreviewJob>();
 globalForHarvest.sunoPreviewJobs = previewJobs;
+const previewResults = globalForHarvest.sunoPreviewResults || new Map<string, { buffer: Buffer; expiresAt: number }>();
+globalForHarvest.sunoPreviewResults = previewResults;
 if (!globalForHarvest.sunoPlaywrightHarvest)
   globalForHarvest.sunoPlaywrightHarvest = Promise.resolve();
 
@@ -115,6 +128,29 @@ function previewCachePath(clipId: string): string {
 
 function waitMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Browser-side drain of audio chunks captured by the MSE appendBuffer hook.
+ * Splices new chunks out of the store (store.bytes stays cumulative) and packs
+ * them as base64. Runs inside page.evaluate — must stay closure-free.
+ */
+function drainMseChunkPayload(): { total: number; b64: string } | null {
+  const store = (window as any).__sunoMse;
+  const chunks: number[][] = store?.chunks;
+  if (!chunks || chunks.length === 0) return null;
+  const taken = chunks.splice(0, chunks.length);
+  const total = taken.reduce((s, c) => s + c.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const c of taken) {
+    out.set(c, o);
+    o += c.length;
+  }
+  let bin = '';
+  for (let i = 0; i < out.length; i += 0x8000)
+    bin += String.fromCharCode.apply(null, Array.from(out.subarray(i, i + 0x8000)));
+  return { total, b64: btoa(bin) };
 }
 
 async function fetchBare(url: string): Promise<Buffer> {
@@ -1618,6 +1654,8 @@ class SunoApi {
   public async getPreviewAudio(clipId: string): Promise<{ buffer: Buffer; contentType: string }> {
     const cached = await this.readPreviewCache(clipId);
     if (cached) return cached;
+    const live = this.readPreviewResult(clipId);
+    if (live) return live;
     const job = this.beginPreviewHarvest(clipId);
     const buffer = await job.promise;
     return { buffer, contentType: this.sniffAudioType(buffer) };
@@ -1625,7 +1663,20 @@ class SunoApi {
 
   /** Return the cached preview file, or null when not captured yet. */
   public async getCachedPreview(clipId: string): Promise<{ buffer: Buffer; contentType: string } | null> {
-    return this.readPreviewCache(clipId);
+    const cached = await this.readPreviewCache(clipId);
+    if (cached) return cached;
+    return this.readPreviewResult(clipId);
+  }
+
+  /** In-memory result of a recently completed capture (see PREVIEW_RESULT_TTL_MS). */
+  private readPreviewResult(clipId: string): { buffer: Buffer; contentType: string } | null {
+    const entry = previewResults.get(clipId);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      previewResults.delete(clipId);
+      return null;
+    }
+    return { buffer: entry.buffer, contentType: this.sniffAudioType(entry.buffer) };
   }
 
   /**
@@ -1670,15 +1721,164 @@ class SunoApi {
     };
   }
 
+  // ─── Progressive Preview Streaming (protocol layer) ─────────────────
+
+  private emitPreviewChunk(job: PreviewJob, chunk: Buffer): void {
+    for (const fn of job.chunkSubs ?? []) {
+      try {
+        fn(chunk);
+      } catch {
+        // A misbehaving subscriber must never break the capture.
+      }
+    }
+  }
+
+  private emitPreviewEnd(job: PreviewJob): void {
+    for (const fn of job.endSubs ?? []) {
+      try {
+        fn();
+      } catch {
+        // ignore subscriber errors
+      }
+    }
+  }
+
+  private emitPreviewError(job: PreviewJob, err: any): void {
+    const error = err instanceof Error ? err : new Error(String(err));
+    for (const fn of job.errSubs ?? []) {
+      try {
+        fn(error);
+      } catch {
+        // ignore subscriber errors
+      }
+    }
+  }
+
+  /**
+   * Subscribe to progressively captured preview chunks.
+   * `onChunk` fires in capture order as MSE segments are appended (before the
+   * capture as a whole finishes); `onEnd` when the capture completed; `onError`
+   * on failure. Chunks already captured before subscribing are NOT replayed —
+   * use openPreviewStream() (cache-first) for a complete progressive stream.
+   * Returns an unsubscribe function. Never throws.
+   */
+  public subscribePreviewChunks(
+    clipId: string,
+    onChunk: (chunk: Buffer) => void,
+    onEnd: () => void,
+    onError: (err: Error) => void
+  ): () => void {
+    // A failed job is kept visible to status pollers for PREVIEW_ERROR_TTL_MS;
+    // a fresh subscriber wants a retry, not the stale error.
+    const stale = previewJobs.get(clipId);
+    if (stale && stale.phase === 'error' && previewJobs.get(clipId) === stale)
+      previewJobs.delete(clipId);
+    const job = this.beginPreviewHarvest(clipId);
+    (job.chunkSubs ??= new Set()).add(onChunk);
+    (job.endSubs ??= new Set()).add(onEnd);
+    (job.errSubs ??= new Set()).add(onError);
+    return () => {
+      job.chunkSubs?.delete(onChunk);
+      job.endSubs?.delete(onEnd);
+      job.errSubs?.delete(onError);
+    };
+  }
+
+  /**
+   * Open a progressive preview stream: playable bytes flow out while the
+   * in-browser capture is still running, so an unfinished track can be
+   * previewed immediately. Cache hits (disk or recent in-memory result)
+   * replay instantly; otherwise the promise resolves as soon as the first
+   * captured chunk arrives (its bytes sniff the Content-Type). Rejects when
+   * the harvest fails before any chunk, or when `signal` aborts while waiting.
+   */
+  public async openPreviewStream(
+    clipId: string,
+    signal?: AbortSignal
+  ): Promise<{ stream: Readable; contentType: string }> {
+    const cached = await this.readPreviewCache(clipId);
+    const replay = cached ?? this.readPreviewResult(clipId);
+    if (replay) {
+      const stream = new Readable({
+        read() {
+          this.push(replay.buffer);
+          this.push(null);
+        }
+      });
+      if (signal) signal.addEventListener('abort', () => stream.destroy(), { once: true });
+      return { stream, contentType: replay.contentType };
+    }
+    if (signal?.aborted) throw new Error('Preview stream request aborted');
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      // Push-driven: chunks arrive from the capture loop at ~500ms cadence,
+      // so read() backpressure is irrelevant at this rate.
+      const stream = new Readable({ read() {} });
+      const unsubscribe = this.subscribePreviewChunks(
+        clipId,
+        (chunk) => {
+          if (!settled) {
+            settled = true;
+            signal?.removeEventListener('abort', onAbort);
+            resolve({ stream, contentType: this.sniffAudioType(chunk) });
+          }
+          stream.push(chunk);
+        },
+        () => {
+          signal?.removeEventListener('abort', onAbort);
+          if (!settled) {
+            // Capture ended without emitting any chunk (harvest normally
+            // throws in that case, so this is just a defensive fallback).
+            settled = true;
+            resolve({ stream, contentType: 'application/octet-stream' });
+          }
+          stream.push(null);
+        },
+        (err) => {
+          unsubscribe();
+          signal?.removeEventListener('abort', onAbort);
+          if (!settled) {
+            settled = true;
+            reject(err);
+          } else {
+            stream.destroy(err);
+          }
+        }
+      );
+      const onAbort = () => {
+        unsubscribe();
+        if (!settled) {
+          settled = true;
+          reject(new Error('Preview stream request aborted'));
+        } else {
+          stream.destroy();
+        }
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      // Drop the job subscription when the consumer (HTTP client) goes away.
+      stream.once('close', unsubscribe);
+    });
+  }
+
   private async runPreviewJob(clipId: string, job: PreviewJob): Promise<Buffer> {
     try {
       const buffer = await this.harvestPreviewAudio(clipId, job);
-      // Success: the cache file is the source of truth now.
+      // Success: retain the result in memory for a short TTL so reconnecting
+      // stream clients replay it instead of re-running a full browser capture
+      // ('complete' clips also get the durable on-disk cache below).
+      const now = Date.now();
+      for (const [id, entry] of previewResults) {
+        if (entry.expiresAt <= now) previewResults.delete(id);
+      }
+      previewResults.set(clipId, { buffer, expiresAt: now + PREVIEW_RESULT_TTL_MS });
       if (previewJobs.get(clipId) === job) previewJobs.delete(clipId);
+      this.emitPreviewEnd(job);
       return buffer;
     } catch (err: any) {
       job.phase = 'error';
       job.error = err?.message || String(err);
+      this.emitPreviewError(job, err);
       logger.warn({ clipId, err: job.error }, 'Preview harvest failed');
       const timer = setTimeout(() => {
         if (previewJobs.get(clipId) === job) previewJobs.delete(clipId);
@@ -1878,6 +2078,7 @@ class SunoApi {
 
       const targetSec = clipDurationSec && clipDurationSec > 0 ? clipDurationSec : 20;
       const deadline = Date.now() + Math.min(PREVIEW_CAPTURE_MAX_MS, targetSec * 1000 + 60000);
+      const collected: Buffer[] = [];
       let playback: { t: number; d: number; ended: boolean; paused: boolean; bytes: number } | null = null;
       while (Date.now() < deadline) {
         playback = await page.evaluate(() => {
@@ -1892,6 +2093,14 @@ class SunoApi {
             bytes: store?.bytes || 0
           };
         }).catch(() => null);
+        // Incremental drain: push freshly appended MSE chunks to progressive
+        // stream subscribers while playback is still running.
+        const drained = await page.evaluate(drainMseChunkPayload).catch(() => null);
+        if (drained && drained.total > 0) {
+          const chunk = Buffer.from(drained.b64, 'base64');
+          collected.push(chunk);
+          if (job) this.emitPreviewChunk(job, chunk);
+        }
         if (playback && job) {
           job.currentSec = playback.t;
           if (playback.d > 0) job.durationSec = playback.d;
@@ -1912,22 +2121,9 @@ class SunoApi {
       if (!playback.ended && playback.t < targetSec * 0.9)
         throw new Error('Preview capture stopped before end of listen window');
 
-      const packed = await page.evaluate(() => {
-        const store = (window as any).__sunoMse || { chunks: [] as number[][] };
-        const chunks: number[][] = store.chunks || [];
-        const total = chunks.reduce((s, c) => s + c.length, 0);
-        const out = new Uint8Array(total);
-        let o = 0;
-        for (const c of chunks) {
-          out.set(c, o);
-          o += c.length;
-        }
-        let bin = '';
-        for (let i = 0; i < out.length; i += 0x8000)
-          bin += String.fromCharCode.apply(null, Array.from(out.subarray(i, i + 0x8000)));
-        return { total, b64: btoa(bin) };
-      });
-      const buffer = Buffer.from(packed.b64, 'base64');
+      const packed = await page.evaluate(drainMseChunkPayload).catch(() => null);
+      if (packed && packed.total > 0) collected.push(Buffer.from(packed.b64, 'base64'));
+      const buffer = Buffer.concat(collected);
       if (!looksLikeAudio(buffer))
         throw new Error('Preview capture did not produce playable audio');
       return buffer;

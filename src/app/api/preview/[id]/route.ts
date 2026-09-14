@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
+import { Readable } from 'stream';
 import { sunoApi } from '@/lib/SunoApi';
 import { corsHeaders } from '@/lib/utils';
 
@@ -19,6 +20,26 @@ export async function GET(
   try {
     const cookie = (await cookies()).toString();
     const api = await sunoApi(cookie);
+
+    // ?stream=1: progressive chunked response — audio bytes flow while the
+    // in-browser capture is still running, so an unfinished track can be
+    // previewed before the harvest completes.
+    const wantStream = req.nextUrl.searchParams.get('stream');
+    if (wantStream === '1' || wantStream === 'true') {
+      const { stream, contentType } = await api.openPreviewStream(clipId, req.signal);
+      const webStream = Readable.toWeb(stream) as ReadableStream;
+      return new Response(webStream, {
+        status: 200,
+        headers: {
+          'Content-Type': contentType,
+          'Content-Disposition': `inline; filename="${clipId}-preview"`,
+          // Never buffer/transform a stream that is still growing.
+          'Cache-Control': 'no-cache, no-transform',
+          'X-Accel-Buffering': 'no',
+          ...corsHeaders
+        }
+      });
+    }
 
     // Already captured: stream the binary straight away.
     const cached = await api.getCachedPreview(clipId);

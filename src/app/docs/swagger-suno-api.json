@@ -870,6 +870,86 @@
           }
         }
       }
+    },
+    "/api/preview/{id}": {
+      "get": {
+        "summary": "Get or stream a clip's in-player preview (no unlock / no download credit).",
+        "description": "Without `stream`: returns the captured preview binary when ready, otherwise 202 with harvest status (poll with Retry-After). With `?stream=1`: opens a progressive chunked audio stream that starts flowing while the in-browser capture is still running, so an unfinished track can be previewed immediately. The response has no Content-Length; the stream ends when the capture completes. Content-Type is sniffed from the first captured chunk (e.g. audio/webm, audio/mp4).",
+        "tags": ["default"],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Clip ID (UUID)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stream",
+            "in": "query",
+            "required": false,
+            "description": "Set to 1 (or true) for a progressive chunked audio stream instead of poll-based status",
+            "schema": {
+              "type": "string",
+              "enum": ["1", "true"]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audio body (complete buffer, or progressive chunk stream when stream=1)"
+          },
+          "202": {
+            "description": "Capture in progress (only without stream=1); body carries harvest status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": { "type": "string" },
+                    "state": { "type": "string", "enum": ["waiting_clip", "queued", "capturing", "error"] },
+                    "queuePosition": { "type": "integer" },
+                    "progressPercent": { "type": "number", "nullable": true },
+                    "currentSec": { "type": "number" },
+                    "durationSec": { "type": "number" },
+                    "bytes": { "type": "integer" },
+                    "error": { "type": "string", "nullable": true },
+                    "retry_after": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid clip id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": { "type": "string", "example": "Invalid clip id" }
+                  }
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Preview capture failed or could not be started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

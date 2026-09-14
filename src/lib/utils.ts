@@ -36,12 +36,17 @@ export const isPage = (target: any): target is Page => {
  * @param signal `const controller = new AbortController(); controller.status`
  * @returns {Promise<void>} 
  */
-export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> => {
+export const waitForRequests = (
+  page: Page,
+  signal: AbortSignal,
+  hardDeadlineMs: number = 45000
+): Promise<void> => {
   return new Promise((resolve, reject) => {
     const urlPattern = /^https:\/\/(img[a-zA-Z0-9]*\.hcaptcha\.com|hcaptcha-assets-prod\.suno\.com|hcaptcha-imgs-prod\.suno\.com)\/.*$/;
     let timeoutHandle: NodeJS.Timeout | null = null;
     let activeRequestCount = 0;
-    let requestOccurred = false;
+    let requestCount = 0;
+    let settled = false;
 
     const cleanupListeners = () => {
       page.off('request', onRequest);
@@ -50,20 +55,31 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
       signal.removeEventListener('abort', onAbort);
     };
 
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanupListeners();
+      clearTimeout(initialTimeout);
+      clearTimeout(hardDeadlineTimer);
+      if (timeoutHandle)
+        clearTimeout(timeoutHandle);
+      if (err) reject(err); else resolve();
+    };
+
     const resetTimeout = () => {
       if (timeoutHandle)
         clearTimeout(timeoutHandle);
       if (activeRequestCount === 0) {
         timeoutHandle = setTimeout(() => {
-          cleanupListeners();
-          resolve();
+          logger.info(`hCaptcha image requests settled (${requestCount} seen)`);
+          finish();
         }, 1000); // 1 second of no requests
       }
     };
 
     const onRequest = (request: { url: () => string }) => {
       if (urlPattern.test(request.url())) {
-        requestOccurred = true;
+        requestCount++;
         activeRequestCount++;
         if (timeoutHandle)
           clearTimeout(timeoutHandle);
@@ -78,31 +94,33 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
       }
     };
 
-    // Wait for an hCaptcha request for up to 1 minute
+    // Wait for an hCaptcha request for up to 30 seconds
     const initialTimeout = setTimeout(() => {
-      if (!requestOccurred) {
-        cleanupListeners();
-        reject(new Error('No hCaptcha request occurred within 1 minute.'));
+      if (requestCount === 0) {
+        finish(new Error('No hCaptcha request occurred within 30 seconds.'));
       } else {
-        // Start waiting for no hCaptcha requests
-        resetTimeout();
+        // Requests started but never quiesced; proceed with whatever has loaded
+        logger.info(`hCaptcha requests seen but never quiesced (${requestCount} total); proceeding`);
+        finish();
       }
-    }, 60000); // 1 minute timeout
+    }, 30000);
+
+    // Absolute cap: never wait longer than hardDeadlineMs, no matter what
+    const hardDeadlineTimer = setTimeout(() => {
+      logger.info(`hCaptcha wait hit hard deadline after ${hardDeadlineMs}ms (${requestCount} requests)`);
+      finish();
+    }, hardDeadlineMs);
 
     page.on('request', onRequest);
     page.on('requestfinished', onRequestFinished);
     page.on('requestfailed', onRequestFinished);
 
     const onAbort = () => {
-      cleanupListeners();
-      clearTimeout(initialTimeout);
-      if (timeoutHandle)
-        clearTimeout(timeoutHandle);
-      reject(new Error('AbortError'));
+      finish(new Error('AbortError'));
     };
 
     signal.addEventListener('abort', onAbort, { once: true });
-  }); 
+  });
 }
 
 export const corsHeaders = {

@@ -398,7 +398,7 @@ class SunoApi {
     try {
       page = await context.newPage();
       await this.installTurnstileHook(page);
-      await page.goto('https://suno.com/', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
+      await page.goto('https://suno.com/', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 60000 });
 
       logger.info('Waiting for Suno interface to load');
       // New Suno UI no longer calls /api/project/; wait for a known API and a short render delay
@@ -494,18 +494,72 @@ class SunoApi {
       ]);
       if (raced.type === 'token')
         return raced.token;
-      if (raced.type === 'solver_failed')
-        logger.warn('CAPTCHA solver error: ' + raced.err?.message);
-      else if (!tokenSettled)
+      if (raced.type === 'solver_failed') {
+        // Grace window: managed Turnstile can pass silently right as the kind-poll expires
+        const lateToken = await Promise.race([
+          tokenPromise,
+          waitMs(5000).then(() => null)
+        ]).catch(() => null);
+        if (lateToken)
+          return lateToken;
+        throw new Error('CAPTCHA solver failed: ' + (raced.err?.message || 'unknown'));
+      }
+      if (!tokenSettled)
         await this.triggerCreateOnCreatePage(page);
       return await tokenPromise;
     } finally {
       clearTimeout(timeoutId);
       controller.abort();
-      if (page && routeHandler) await page.unroute(generateRoute, routeHandler);
-      await context.close().catch(() => {});
-      await browser.close().catch(() => {});
+      try {
+        if (page && routeHandler) {
+          await Promise.race([
+            page.unroute(generateRoute, routeHandler),
+            waitMs(5000).then(() => logger.info('page.unroute timed out; continuing teardown'))
+          ]);
+        }
+      } catch {
+        // never block teardown on unroute
+      }
+      await this.disposeBrowser(browser, context);
     }
+  }
+
+  /**
+   * Close a browser with a hard cap: a wedged renderer can make CDP close calls
+   * hang forever, which would leak the chromium process and the caller's request.
+   */
+  private async disposeBrowser(browser: Browser, context: BrowserContext): Promise<void> {
+    const proc = (browser as any).process?.() as { kill: (signal: string) => void } | null;
+    let closed = false;
+    await Promise.race([
+      (async () => {
+        await context.close().catch(() => {});
+        await browser.close().catch(() => {});
+        closed = true;
+      })(),
+      waitMs(10000).then(() => {
+        if (closed) return;
+        logger.info('Browser teardown timed out; killing chromium');
+        try {
+          proc?.kill('SIGKILL');
+        } catch {
+          // ignore kill errors
+        }
+      })
+    ]).catch(() => {});
+  }
+
+  /**
+   * Race a browser-bound operation against a hard cap. On timeout the operation
+   * throws, the caller's finally runs, and disposeBrowser SIGKILLs the wedged browser.
+   */
+  private async withBrowserWatchdog<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    return Promise.race([
+      promise,
+      waitMs(ms).then(() => {
+        throw new Error(label + ' timed out after ' + Math.round(ms / 1000) + 's');
+      })
+    ]);
   }
 
   /**
@@ -745,14 +799,29 @@ class SunoApi {
   ): Promise<void> {
     const frame = page.frameLocator('iframe[title*="hCaptcha"]');
     const challenge = frame.locator('.challenge-container');
-    const MAX_CAPTCHA_ATTEMPTS = 5;
+    const MAX_CAPTCHA_ATTEMPTS = 3;
 
     for (let attempt = 0; attempt < MAX_CAPTCHA_ATTEMPTS; attempt++) {
-      await waitForRequests(page, signal);
+      logger.info(`hCaptcha attempt ${attempt + 1}/${MAX_CAPTCHA_ATTEMPTS}`);
+      const visible = await challenge.isVisible({ timeout: 4000 }).catch(() => false);
+      if (!visible) {
+        logger.info('hCaptcha challenge not open; clicking checkbox');
+        const checkbox = frame.locator('#checkbox, .checkbox');
+        await checkbox.first().click({ timeout: 8000 }).catch((e: any) => {
+          logger.info('hCaptcha checkbox click failed: ' + e.message);
+        });
+        try {
+          await challenge.waitFor({ state: 'visible', timeout: 15000 });
+        } catch {
+          throw new Error('hCaptcha challenge did not open within 15s');
+        }
+      }
+      await waitForRequests(page, signal, 30000);
       await sleep(2, 3); // Allow challenge images to fully render before screenshot
 
       const promptText = await challenge.locator('.prompt-text')
         .first().innerText().catch(() => '');
+      logger.info('hCaptcha prompt: ' + (promptText.slice(0, 80) || '(empty)'));
       const drag = promptText.toLowerCase().includes('drag');
 
       let captcha: any;
@@ -769,7 +838,12 @@ class SunoApi {
               path.join(process.cwd(), 'public', 'drag-instructions.jpg')
             )).toString('base64');
           }
-          captcha = await this.solver.coordinates(payload);
+          captcha = await Promise.race([
+            this.solver.coordinates(payload),
+            waitMs(90000).then(() => {
+              throw new Error('2Captcha coordinates timed out after 90s');
+            })
+          ]);
           break;
         } catch(err: any) {
           logger.info(err.message);
@@ -1419,9 +1493,10 @@ class SunoApi {
     globalForHarvest.sunoPlaywrightHarvest = new Promise<void>((resolve) => { release = resolve; });
     await previous.catch(() => {});
     try {
-      const harvested = await this.capturePreviewViaBrowser(
-        clipId,
-        durationSec
+      const harvested = await this.withBrowserWatchdog(
+        this.capturePreviewViaBrowser(clipId, durationSec),
+        150000,
+        'Preview capture'
       );
       if (clipStatus === 'complete')
         await this.writePreviewCache(clipId, harvested);
@@ -1536,8 +1611,7 @@ class SunoApi {
         throw new Error('Preview capture did not produce playable audio');
       return buffer;
     } finally {
-      await context.close().catch(() => {});
-      await browser.close().catch(() => {});
+      await this.disposeBrowser(browser, context);
     }
   }
 
@@ -1564,7 +1638,11 @@ class SunoApi {
     globalForHarvest.sunoPlaywrightHarvest = new Promise<void>((resolve) => { release = resolve; });
     await previous.catch(() => {});
     try {
-      const harvested = await this.downloadClipViaBrowser(clipId);
+      const harvested = await this.withBrowserWatchdog(
+        this.downloadClipViaBrowser(clipId),
+        150000,
+        'Browser download harvest'
+      );
       await this.writeAudioCache(clipId, harvested);
       return harvested;
     } finally {
@@ -1743,8 +1821,7 @@ class SunoApi {
       throw new Error('Playwright harvest did not receive a playable audio file');
     } finally {
       closed = true;
-      await context.close().catch(() => {});
-      await browser.close().catch(() => {});
+      await this.disposeBrowser(browser, context);
     }
   }
 

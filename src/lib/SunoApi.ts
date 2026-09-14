@@ -3,6 +3,7 @@ import UserAgent from 'user-agents';
 import pino from 'pino';
 import yn from 'yn';
 import { isPage, sleep, waitForRequests } from '@/lib/utils';
+import { CaptchaGate, ClientGoneError } from '@/lib/captcha-gate';
 import * as cookie from 'cookie';
 import { randomUUID } from 'node:crypto';
 import { Solver } from '@2captcha/captcha-solver';
@@ -148,6 +149,7 @@ class SunoApi {
   private userAgent?: string;
   private cookies: Record<string, string | undefined>;
   private solver = new Solver(process.env.TWOCAPTCHA_KEY + '');
+  private captchaGate = new CaptchaGate();
   private ghostCursorEnabled = yn(process.env.BROWSER_GHOST_CURSOR, { default: false });
   private cursor?: Cursor;
 
@@ -382,15 +384,21 @@ class SunoApi {
    * still fall back to hCaptcha (version 1).
    * @returns {string|null} Captcha token. If no verification is required, returns null
    */
-  public async getCaptcha(): Promise<string|null> {
+  public async getCaptcha(engage: () => void = () => {}, signal?: AbortSignal): Promise<string|null> {
     this.captchaTokenProvider = undefined;
     if (!await this.captchaRequired())
       return null;
 
+    // Becoming the solver engages the per-account soft lock so concurrent
+    // requests queue up instead of each launching their own browser + 2Captcha solve.
+    engage();
     logger.info('CAPTCHA required. Launching browser...');
     const { browser, context } = await this.launchBrowser();
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 300000);
+    const onExternalAbort = () => controller.abort();
+    if (signal)
+      signal.addEventListener('abort', onExternalAbort, { once: true });
     let page!: Page;
     let routeHandler: ((route: any) => Promise<void>) | null = null;
     const generateRoute = /\/api\/generate\/v2/;
@@ -433,7 +441,10 @@ class SunoApi {
       let tokenSettled = false;
       const tokenPromise = new Promise<string>((resolve, reject) => {
         const onAbort = () => {
-          if (!tokenSettled) { tokenSettled = true; reject(new Error('Captcha timeout')); }
+          if (!tokenSettled) {
+            tokenSettled = true;
+            reject(signal?.aborted ? new ClientGoneError() : new Error('Captcha timeout'));
+          }
         };
         controller.signal.addEventListener('abort', onAbort, { once: true });
         routeHandler = async (route: any) => {
@@ -510,6 +521,8 @@ class SunoApi {
     } finally {
       clearTimeout(timeoutId);
       controller.abort();
+      if (signal)
+        signal.removeEventListener('abort', onExternalAbort);
       try {
         if (page && routeHandler) {
           await Promise.race([
@@ -915,7 +928,8 @@ class SunoApi {
     prompt: string,
     make_instrumental: boolean = false,
     model?: string,
-    wait_audio: boolean = false
+    wait_audio: boolean = false,
+    signal?: AbortSignal
   ): Promise<AudioInfo[]> {
     await this.keepAlive(false);
     const startTime = Date.now();
@@ -926,7 +940,15 @@ class SunoApi {
       undefined,
       make_instrumental,
       model,
-      wait_audio
+      wait_audio,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      signal
     );
     const costTime = Date.now() - startTime;
     logger.info('Generate Response:\n' + JSON.stringify(audios, null, 2));
@@ -975,7 +997,8 @@ class SunoApi {
     make_instrumental: boolean = false,
     model?: string,
     wait_audio: boolean = false,
-    negative_tags?: string
+    negative_tags?: string,
+    signal?: AbortSignal
   ): Promise<AudioInfo[]> {
     const startTime = Date.now();
     const audios = await this.generateSongs(
@@ -986,7 +1009,14 @@ class SunoApi {
       make_instrumental,
       model,
       wait_audio,
-      negative_tags
+      negative_tags,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      signal
     );
     const costTime = Date.now() - startTime;
     logger.info(
@@ -1024,10 +1054,97 @@ class SunoApi {
     continue_at?: number,
     sound_loop?: boolean,
     sound_tempo?: number,
-    sound_key?: string
+    sound_key?: string,
+    signal?: AbortSignal
   ): Promise<AudioInfo[]> {
-    await this.keepAlive();
-    const captchaToken = await this.getCaptcha();
+    // The gated section is kept short on purpose: keepAlive + captcha
+    // acquisition + the generate POST. The wait_audio polling runs outside the
+    // gate so queued requests are only blocked by the solver's submission, not
+    // by its audio rendering.
+    const clips = await this.captchaGate.run(async (engage) => {
+      try {
+        await this.keepAlive();
+        const captchaToken = await this.getCaptcha(engage, signal);
+        return await this.postGenerate(
+          prompt,
+          isCustom,
+          tags,
+          title,
+          make_instrumental,
+          model,
+          negative_tags,
+          task,
+          continue_clip_id,
+          continue_at,
+          sound_loop,
+          sound_tempo,
+          sound_key,
+          captchaToken
+        );
+      } catch (e) {
+        // A disconnected client must not fail the queued backlog: map any
+        // in-flight failure to ClientGoneError so the gate treats it neutrally.
+        if (signal?.aborted)
+          throw new ClientGoneError();
+        throw e;
+      }
+    }, signal);
+    const songIds = clips.map((audio: any) => audio.id);
+    //Want to wait for music file generation
+    if (wait_audio) {
+      const startTime = Date.now();
+      let lastResponse: AudioInfo[] = [];
+      await sleep(5, 5);
+      while (Date.now() - startTime < 100000) {
+        const response = await this.get(songIds);
+        const allCompleted = response.every(
+          (audio) => audio.status === 'streaming' || audio.status === 'complete'
+        );
+        const allError = response.every((audio) => audio.status === 'error');
+        if (allCompleted || allError) {
+          return response;
+        }
+        lastResponse = response;
+        await sleep(3, 6);
+        await this.keepAlive(true);
+      }
+      return lastResponse;
+    }
+    return clips.map((audio: any) => ({
+      id: audio.id,
+      title: audio.title,
+      image_url: audio.image_url,
+      lyric: audio.metadata.prompt,
+      audio_url: audio.audio_url,
+      video_url: audio.video_url,
+      created_at: audio.created_at,
+      model_name: audio.model_name,
+      status: audio.status,
+      gpt_description_prompt: audio.metadata.gpt_description_prompt,
+      prompt: audio.metadata.prompt,
+      type: audio.metadata.type,
+      tags: audio.metadata.tags,
+      negative_tags: audio.metadata.negative_tags,
+      duration: audio.metadata.duration
+    }));
+  }
+
+  private async postGenerate(
+    prompt: string,
+    isCustom: boolean,
+    tags?: string,
+    title?: string,
+    make_instrumental?: boolean,
+    model?: string,
+    negative_tags?: string,
+    task?: string,
+    continue_clip_id?: string,
+    continue_at?: number,
+    sound_loop?: boolean,
+    sound_tempo?: number,
+    sound_key?: string,
+    captchaToken: string | null = null
+  ): Promise<any[]> {
     const payload: any = {
       token: captchaToken,
       generation_type: 'TEXT',
@@ -1087,7 +1204,6 @@ class SunoApi {
             tags: tags,
             title: title,
             make_instrumental: make_instrumental,
-            wait_audio: wait_audio,
             negative_tags: negative_tags,
             payload: payload
           },
@@ -1105,45 +1221,7 @@ class SunoApi {
     if (response.status !== 200) {
       throw new Error('Error response:' + response.statusText);
     }
-    const songIds = response.data.clips.map((audio: any) => audio.id);
-    //Want to wait for music file generation
-    if (wait_audio) {
-      const startTime = Date.now();
-      let lastResponse: AudioInfo[] = [];
-      await sleep(5, 5);
-      while (Date.now() - startTime < 100000) {
-        const response = await this.get(songIds);
-        const allCompleted = response.every(
-          (audio) => audio.status === 'streaming' || audio.status === 'complete'
-        );
-        const allError = response.every((audio) => audio.status === 'error');
-        if (allCompleted || allError) {
-          return response;
-        }
-        lastResponse = response;
-        await sleep(3, 6);
-        await this.keepAlive(true);
-      }
-      return lastResponse;
-    } else {
-      return response.data.clips.map((audio: any) => ({
-        id: audio.id,
-        title: audio.title,
-        image_url: audio.image_url,
-        lyric: audio.metadata.prompt,
-        audio_url: audio.audio_url,
-        video_url: audio.video_url,
-        created_at: audio.created_at,
-        model_name: audio.model_name,
-        status: audio.status,
-        gpt_description_prompt: audio.metadata.gpt_description_prompt,
-        prompt: audio.metadata.prompt,
-        type: audio.metadata.type,
-        tags: audio.metadata.tags,
-        negative_tags: audio.metadata.negative_tags,
-        duration: audio.metadata.duration
-      }));
-    }
+    return response.data.clips;
   }
 
   /**
@@ -1193,9 +1271,10 @@ class SunoApi {
     negative_tags: string = '',
     title: string = '',
     model?: string,
-    wait_audio?: boolean
+    wait_audio?: boolean,
+    signal?: AbortSignal
   ): Promise<AudioInfo[]> {
-    return this.generateSongs(prompt, true, tags, title, false, model, wait_audio, negative_tags, 'extend', audioId, continueAt);
+    return this.generateSongs(prompt, true, tags, title, false, model, wait_audio, negative_tags, 'extend', audioId, continueAt, undefined, undefined, undefined, signal);
   }
 
   /**
@@ -1237,7 +1316,8 @@ class SunoApi {
     model?: string,
     wait_audio: boolean = false,
     tempo?: number,
-    key?: string
+    key?: string,
+    signal?: AbortSignal
   ): Promise<AudioInfo[]> {
     const startTime = Date.now();
     // Title is title-cased and truncated to ~100 chars to match official web behavior
@@ -1261,7 +1341,8 @@ class SunoApi {
       undefined,
       loop,
       tempo,
-      key
+      key,
+      signal
     );
     const costTime = Date.now() - startTime;
     logger.info('Generate Sound Response:\n' + JSON.stringify(audios, null, 2));

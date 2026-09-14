@@ -2,6 +2,7 @@ import { NextResponse, NextRequest } from "next/server";
 import { cookies } from 'next/headers';
 import { DEFAULT_MODEL, rewriteForbiddenAudioUrls, sunoApi } from "@/lib/SunoApi";
 import { corsHeaders } from "@/lib/utils";
+import { ClientGoneError } from "@/lib/captcha-gate";
 
 export const maxDuration = 60; // allow longer timeout for wait_audio == true
 export const dynamic = "force-dynamic";
@@ -27,7 +28,8 @@ export async function POST(req: NextRequest) {
         Boolean(make_instrumental),
         model || DEFAULT_MODEL,
         Boolean(wait_audio),
-        negative_tags
+        negative_tags,
+        req.signal
       );
       return new NextResponse(JSON.stringify(rewriteForbiddenAudioUrls(audioInfo, req.nextUrl.origin)), {
         status: 200,
@@ -38,6 +40,8 @@ export async function POST(req: NextRequest) {
       });
     } catch (error: any) {
       console.error('Error generating custom audio:', error);
+      if (error instanceof ClientGoneError)
+        console.log('Client gone; dropped request: ' + error.message);
       return new NextResponse(JSON.stringify({ error: error.response?.data?.detail || error.toString() }), {
         status: error.response?.status || 500,
         headers: {

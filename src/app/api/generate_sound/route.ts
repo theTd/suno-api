@@ -2,6 +2,7 @@ import { NextResponse, NextRequest } from "next/server";
 import { cookies } from 'next/headers'
 import { DEFAULT_MODEL, rewriteForbiddenAudioUrls, sunoApi } from "@/lib/SunoApi";
 import { corsHeaders } from "@/lib/utils";
+import { ClientGoneError } from "@/lib/captcha-gate";
 
 export const dynamic = "force-dynamic";
 
@@ -27,7 +28,8 @@ export async function POST(req: NextRequest) {
         model || DEFAULT_MODEL,
         Boolean(wait_audio),
         tempo,
-        key
+        key,
+        req.signal
       );
 
       return new NextResponse(JSON.stringify(rewriteForbiddenAudioUrls(audioInfo, req.nextUrl.origin)), {
@@ -39,6 +41,15 @@ export async function POST(req: NextRequest) {
       });
     } catch (error: any) {
       console.error('Error generating sound:', error);
+
+      // Client disconnected while queued/in flight; nothing meaningful to respond to
+      if (error instanceof ClientGoneError) {
+        console.log('Client gone; dropped request: ' + error.message);
+        return new NextResponse(JSON.stringify({ error: error.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
 
       // Handle different types of errors
       if (error.response) {

@@ -203,7 +203,7 @@ function registerTaskTool(
 const GENERATE_MUSIC_SCHEMA = {
   prompt: z.string().describe("Text description of the music to generate"),
   make_instrumental: z.boolean().optional().describe("Whether the generated audio should be instrumental only"),
-  model: z.string().optional().describe("Model name to use for generation (default: chirp-fenix)"),
+  model: z.string().optional().describe("Model name to use for generation (default: chirp-hawk)"),
   wait_audio: z.boolean().optional().describe("If true, blocks until audio generation is complete (up to ~100s)"),
 };
 
@@ -212,7 +212,7 @@ const GENERATE_CUSTOM_MUSIC_SCHEMA = {
   tags: z.string().describe("Style tags / genre (e.g., 'pop, upbeat')"),
   title: z.string().describe("Title of the song"),
   make_instrumental: z.boolean().optional().describe("Whether the generated audio should be instrumental only"),
-  model: z.string().optional().describe("Model name to use (default: chirp-fenix)"),
+  model: z.string().optional().describe("Model name to use (default: chirp-hawk)"),
   wait_audio: z.boolean().optional().describe("If true, blocks until audio generation is complete (up to ~100s)"),
   negative_tags: z.string().optional().describe("Tags to exclude from generation"),
 };
@@ -224,14 +224,14 @@ const EXTEND_AUDIO_SCHEMA = {
   tags: z.string().optional().describe("Style tags for the extension"),
   negative_tags: z.string().optional().describe("Tags to exclude"),
   title: z.string().optional().describe("Title of the song"),
-  model: z.string().optional().describe("Model name (default: chirp-fenix)"),
+  model: z.string().optional().describe("Model name (default: chirp-hawk)"),
   wait_audio: z.boolean().optional().describe("Wait for generation to complete"),
 };
 
 const GENERATE_SOUND_SCHEMA = {
   prompt: z.string().describe("Text description of the sound effect"),
   loop: z.boolean().optional().describe("Whether the sound should loop"),
-  model: z.string().optional().describe("Model name (default: chirp-fenix)"),
+  model: z.string().optional().describe("Model name (default: chirp-hawk)"),
   wait_audio: z.boolean().optional().describe("Wait for generation to complete"),
   tempo: z.number().optional().describe("BPM of the generated sound effect"),
   key: z.string().optional().describe("Musical key of the generated sound effect"),

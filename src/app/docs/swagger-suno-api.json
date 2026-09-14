@@ -301,8 +301,8 @@
                   },
                   "model": {
                     "type": "string",
-                    "description": "Model name, default is chirp-fenix",
-                    "example": "chirp-fenix"
+                    "description": "Model name, default is chirp-hawk",
+                    "example": "chirp-hawk"
                   },
                   "tempo": {
                     "type": "number",

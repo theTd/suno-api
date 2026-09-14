@@ -18,7 +18,7 @@ const cache = globalForSunoApi.sunoApiCache || new Map<string, SunoApi>();
 globalForSunoApi.sunoApiCache = cache;
 
 const logger = pino();
-export const DEFAULT_MODEL = 'chirp-fenix';
+export const DEFAULT_MODEL = 'chirp-hawk';
 
 export interface AudioInfo {
   id: string; // Unique identifier for the audio

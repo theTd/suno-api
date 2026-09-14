@@ -1,6 +1,6 @@
 import { NextResponse, NextRequest } from 'next/server';
 import { cookies } from 'next/headers';
-import { sunoApi } from '@/lib/SunoApi';
+import { rewriteForbiddenAudioUrls, sunoApi } from '@/lib/SunoApi';
 import { corsHeaders } from '@/lib/utils';
 
 export const dynamic = 'force-dynamic';
@@ -21,7 +21,7 @@ export async function GET(req: NextRequest) {
         audioInfo = await (await sunoApi(cookie)).get(undefined, page);
       }
 
-      return new NextResponse(JSON.stringify(audioInfo), {
+      return new NextResponse(JSON.stringify(rewriteForbiddenAudioUrls(audioInfo, req.nextUrl.origin)), {
         status: 200,
         headers: {
           'Content-Type': 'application/json',

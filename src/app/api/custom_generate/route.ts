@@ -1,6 +1,6 @@
 import { NextResponse, NextRequest } from "next/server";
 import { cookies } from 'next/headers';
-import { DEFAULT_MODEL, sunoApi } from "@/lib/SunoApi";
+import { DEFAULT_MODEL, rewriteForbiddenAudioUrls, sunoApi } from "@/lib/SunoApi";
 import { corsHeaders } from "@/lib/utils";
 
 export const maxDuration = 60; // allow longer timeout for wait_audio == true
@@ -29,7 +29,7 @@ export async function POST(req: NextRequest) {
         Boolean(wait_audio),
         negative_tags
       );
-      return new NextResponse(JSON.stringify(audioInfo), {
+      return new NextResponse(JSON.stringify(rewriteForbiddenAudioUrls(audioInfo, req.nextUrl.origin)), {
         status: 200,
         headers: {
           'Content-Type': 'application/json',

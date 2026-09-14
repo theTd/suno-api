@@ -7,10 +7,11 @@ import * as cookie from 'cookie';
 import { randomUUID } from 'node:crypto';
 import { Solver } from '@2captcha/captcha-solver';
 import { paramsCoordinates } from '@2captcha/captcha-solver/dist/structs/2captcha';
-import { BrowserContext, Page, Locator, chromium, firefox } from 'rebrowser-playwright-core';
+import { Browser, BrowserContext, Page, Locator, chromium, firefox } from 'rebrowser-playwright-core';
 import { createCursor, Cursor } from 'ghost-cursor-playwright';
 import { promises as fs } from 'fs';
 import path from 'node:path';
+import os from 'node:os';
 
 // sunoApi instance caching
 const globalForSunoApi = global as unknown as { sunoApiCache?: Map<string, SunoApi> };
@@ -19,6 +20,65 @@ globalForSunoApi.sunoApiCache = cache;
 
 const logger = pino();
 export const DEFAULT_MODEL = 'chirp-hawk';
+const AUDIO_CACHE_DIR = path.join(os.tmpdir(), 'suno-audio-cache');
+const globalForHarvest = global as unknown as {
+  sunoAudioHarvest?: Map<string, Promise<Buffer>>;
+  sunoPlaywrightHarvest?: Promise<unknown>;
+};
+const harvestLocks = globalForHarvest.sunoAudioHarvest || new Map<string, Promise<Buffer>>();
+globalForHarvest.sunoAudioHarvest = harvestLocks;
+if (!globalForHarvest.sunoPlaywrightHarvest)
+  globalForHarvest.sunoPlaywrightHarvest = Promise.resolve();
+
+export class ClipAudioNotReadyError extends Error {
+  statusCode = 409;
+  constructor(message: string) {
+    super(message);
+    this.name = 'ClipAudioNotReadyError';
+  }
+}
+
+export function isUnusableAudioUrl(url?: string): boolean {
+  return !url || url.includes('/api/forbidden');
+}
+
+export function rewriteForbiddenAudioUrls<T>(data: T, origin: string): T {
+  const base = (origin || '').replace(/\/$/, '');
+  if (!base) return data;
+  const rewriteClip = (clip: any) => {
+    if (!clip || typeof clip !== 'object' || !clip.id) return clip;
+    const ready = clip.status === 'complete' || clip.status === 'streaming';
+    if (ready && isUnusableAudioUrl(clip.audio_url))
+      return { ...clip, audio_url: `${base}/api/file/${clip.id}` };
+    return clip;
+  };
+  if (Array.isArray(data)) return data.map(rewriteClip) as T;
+  return rewriteClip(data) as T;
+}
+
+function looksLikeAudio(buf: Buffer): boolean {
+  if (buf.length < 16) return false;
+  if (buf.subarray(0, 3).toString() === 'ID3') return true;
+  if (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0) return true;
+  const head = buf.subarray(0, 32);
+  if (head.includes(Buffer.from('ftyp')) || head.includes(Buffer.from('moov'))) return true;
+  if (head.includes(Buffer.from('RIFF')) && head.includes(Buffer.from('WAVE'))) return true;
+  if (head.includes(Buffer.from('webm')) || head.includes(Buffer.from('Opus'))) return true;
+  return false;
+}
+
+function audioCachePath(clipId: string): string {
+  return path.join(AUDIO_CACHE_DIR, `${clipId}.bin`);
+}
+
+function waitMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchBare(url: string): Promise<Buffer> {
+  const resp = await axios.get(url, { responseType: 'arraybuffer', timeout: 15000 });
+  return Buffer.from(resp.data);
+}
 
 export interface AudioInfo {
   id: string; // Unique identifier for the audio
@@ -256,9 +316,8 @@ class SunoApi {
 
   /**
    * Launches a browser with the necessary cookies
-   * @returns {BrowserContext}
    */
-  private async launchBrowser(): Promise<BrowserContext> {
+  private async launchBrowser(): Promise<{ browser: Browser; context: BrowserContext }> {
     const args = [
       '--disable-blink-features=AutomationControlled',
       '--disable-web-security',
@@ -278,7 +337,12 @@ class SunoApi {
       args,
       headless: yn(process.env.BROWSER_HEADLESS, { default: true })
     });
-    const context = await browser.newContext({ userAgent: this.userAgent, locale: process.env.BROWSER_LOCALE, viewport: null });
+    const context = await browser.newContext({
+      userAgent: this.userAgent,
+      locale: process.env.BROWSER_LOCALE,
+      viewport: null,
+      acceptDownloads: true
+    });
     const cookies = [];
     const lax: 'Lax' | 'Strict' | 'None' = 'Lax';
     cookies.push({
@@ -301,7 +365,7 @@ class SunoApi {
       })
     }
     await context.addCookies(cookies);
-    return context;
+    return { browser, context };
   }
 
   /**
@@ -316,7 +380,7 @@ class SunoApi {
       return null;
 
     logger.info('CAPTCHA required. Launching browser...');
-    const browser = await this.launchBrowser();
+    const { browser, context } = await this.launchBrowser();
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 300000);
     let page!: Page;
@@ -324,7 +388,7 @@ class SunoApi {
     const generateRoute = /\/api\/generate\/v2/;
 
     try {
-      page = await browser.newPage();
+      page = await context.newPage();
       await this.installTurnstileHook(page);
       await page.goto('https://suno.com/', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
 
@@ -431,7 +495,8 @@ class SunoApi {
       clearTimeout(timeoutId);
       controller.abort();
       if (page && routeHandler) await page.unroute(generateRoute, routeHandler);
-      await browser.close();
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
     }
   }
 
@@ -1231,6 +1296,265 @@ class SunoApi {
       monthly_limit: response.data.monthly_limit,
       monthly_usage: response.data.monthly_usage
     };
+  }
+
+  /**
+   * Return a playable audio buffer for a completed clip.
+   * Suno now redacts audio_url to /api/forbidden and serves DRM-wrapped media_urls.
+   * Try the official download API first, then harvest a file from the Studio UI.
+   */
+  public async getPlayableAudio(clipId: string): Promise<{ buffer: Buffer; contentType: string }> {
+    let pending = harvestLocks.get(clipId);
+    if (!pending) {
+      pending = (async () => {
+        const cached = await this.readAudioCache(clipId);
+        if (cached) return cached.buffer;
+        return this.harvestPlayableAudio(clipId);
+      })();
+      harvestLocks.set(clipId, pending);
+    }
+    try {
+      const buffer = await pending;
+      return { buffer, contentType: this.sniffAudioType(buffer) };
+    } finally {
+      if (harvestLocks.get(clipId) === pending)
+        harvestLocks.delete(clipId);
+    }
+  }
+
+  private sniffAudioType(buffer: Buffer): string {
+    if (buffer.subarray(0, 3).toString() === 'ID3') return 'audio/mpeg';
+    if (buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0) return 'audio/mpeg';
+    if (buffer.subarray(0, 4).toString() === 'RIFF') return 'audio/wav';
+    const head = buffer.subarray(0, 32);
+    if (head.includes(Buffer.from('webm')) || head.includes(Buffer.from('Opus'))) return 'audio/webm';
+    if (head.includes(Buffer.from('ftyp'))) return 'audio/mp4';
+    return 'application/octet-stream';
+  }
+
+  private async readAudioCache(clipId: string): Promise<{ buffer: Buffer; contentType: string } | null> {
+    try {
+      const buffer = await fs.readFile(audioCachePath(clipId));
+      if (!looksLikeAudio(buffer)) return null;
+      return { buffer, contentType: this.sniffAudioType(buffer) };
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeAudioCache(clipId: string, buffer: Buffer): Promise<void> {
+    await fs.mkdir(AUDIO_CACHE_DIR, { recursive: true });
+    const dest = audioCachePath(clipId);
+    const tmp = dest + '.tmp';
+    await fs.writeFile(tmp, buffer);
+    await fs.rename(tmp, dest);
+  }
+
+  private async harvestPlayableAudio(clipId: string): Promise<Buffer> {
+    let clipStatus: string | undefined;
+    try {
+      const clips = await this.get([clipId]);
+      clipStatus = clips[0]?.status;
+    } catch (err: any) {
+      throw new ClipAudioNotReadyError('Clip status unavailable');
+    }
+    if (clipStatus !== 'complete')
+      throw new ClipAudioNotReadyError('Clip is not ready for download');
+
+    const official = await this.downloadClipOfficial(clipId);
+    if (official) {
+      await this.writeAudioCache(clipId, official);
+      return official;
+    }
+
+    logger.info('Official clip download unavailable, harvesting via Playwright: ' + clipId);
+    const previous = globalForHarvest.sunoPlaywrightHarvest || Promise.resolve();
+    let release!: () => void;
+    globalForHarvest.sunoPlaywrightHarvest = new Promise<void>((resolve) => { release = resolve; });
+    await previous.catch(() => {});
+    try {
+      const harvested = await this.downloadClipViaBrowser(clipId);
+      await this.writeAudioCache(clipId, harvested);
+      return harvested;
+    } finally {
+      release();
+    }
+  }
+
+  private async downloadClipOfficial(clipId: string): Promise<Buffer | null> {
+    try {
+      await this.keepAlive(false);
+      const webHeaders = {
+        'x-suno-client': 'suno-web',
+        Origin: 'https://suno.com',
+        Referer: 'https://suno.com/'
+      };
+      const pollDownload = async (): Promise<{ data: any } | null> => {
+        const started = Date.now();
+        while (Date.now() - started < 15000) {
+          const resp = await this.client.get(`${SunoApi.BASE_URL}/api/download/clip/${clipId}`, {
+            params: { format: 'mp3' },
+            timeout: 15000,
+            validateStatus: () => true,
+            headers: webHeaders
+          });
+          const data = resp.data || {};
+          if (data.download_url) return { data };
+          if (data.status === 'processing' || data.reason === 'rate_limited') {
+            await waitMs(2000);
+            continue;
+          }
+          return { data };
+        }
+        return null;
+      };
+
+      const first = await pollDownload();
+      if (first?.data?.download_url) {
+        const buffer = await fetchBare(first.data.download_url);
+        if (looksLikeAudio(buffer)) return buffer;
+        logger.info('Official download_url was not playable audio');
+        return null;
+      }
+
+      if (!first)
+        return null;
+      const needsAuth = first.data?.reason === 'not_authorized';
+      if (!needsAuth) {
+        logger.info(
+          'Official download skipped: ' +
+            JSON.stringify({ ok: first.data?.ok, reason: first.data?.reason, status: first.data?.status })
+        );
+        return null;
+      }
+
+      const auth = await this.client.post(
+        `${SunoApi.BASE_URL}/api/download/authorize`,
+        { item_id: clipId, item_type: 'clip' },
+        { timeout: 15000, validateStatus: () => true, headers: webHeaders }
+      );
+      logger.info(
+        'Download authorize: ' +
+          JSON.stringify({
+            status: auth.status,
+            ok: auth.data?.ok,
+            already_unlocked: auth.data?.already_unlocked,
+            credit_deducted: auth.data?.credit_deducted,
+            reason: auth.data?.reason
+          })
+      );
+      if (auth.status >= 400 || auth.data?.ok !== true)
+        return null;
+
+      const second = await pollDownload();
+      if (second?.data?.download_url) {
+        const buffer = await fetchBare(second.data.download_url);
+        if (looksLikeAudio(buffer)) return buffer;
+        logger.info('Official download_url was not playable audio');
+      } else {
+        logger.info(
+          'Official download skipped: ' +
+            JSON.stringify({ ok: second?.data?.ok, reason: second?.data?.reason, status: second?.data?.status })
+        );
+      }
+      return null;
+    } catch (err: any) {
+      logger.info('Official download failed: ' + err?.message);
+      return null;
+    }
+  }
+
+  private async downloadClipViaBrowser(clipId: string): Promise<Buffer> {
+    const { browser, context } = await this.launchBrowser();
+    let closed = false;
+    try {
+      const page = await context.newPage();
+      const harvested: { signedUrl?: string; download?: { saveAs: (dest: string) => Promise<void> } } = {};
+      const onResponse = async (res: { url: () => string; json: () => Promise<any> }) => {
+        if (closed) return;
+        try {
+          const url = res.url();
+          if (!url.includes('/api/download/clip') || url.includes('/cover')) return;
+          const data = await res.json();
+          if (closed) return;
+          if (data && typeof data.download_url === 'string')
+            harvested.signedUrl = data.download_url;
+        } catch {
+          // ignore non-JSON download responses
+        }
+      };
+      page.on('response', onResponse);
+      page.on('download', (d: any) => { harvested.download = d; });
+      await page.goto(`https://suno.com/song/${clipId}`, {
+        referer: 'https://suno.com/',
+        waitUntil: 'domcontentloaded',
+        timeout: 20000
+      });
+      await this.dismissOverlays(page);
+      const more = page.getByRole('button', { name: 'More menu contents' });
+      await more.first().waitFor({ timeout: 15000 });
+      await this.dismissOverlays(page);
+      const editBox = await page.getByRole('button', { name: 'Edit', exact: true }).boundingBox().catch(() => null);
+      const n = await more.count();
+      let idx = 0;
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < n; i++) {
+        const box = await more.nth(i).boundingBox();
+        if (!box || box.y < 80) continue;
+        const dist = editBox
+          ? Math.abs(box.y - editBox.y) + Math.abs(box.x - editBox.x)
+          : box.y;
+        if (dist < best) {
+          best = dist;
+          idx = i;
+        }
+      }
+      await more.nth(idx).click();
+      const downloadItem = page.getByRole('menuitem', { name: 'Download' })
+        .or(page.getByText('Download', { exact: true }))
+        .last();
+      await downloadItem.waitFor({ timeout: 8000 });
+      await downloadItem.hover().catch(() => {});
+      await downloadItem.click();
+      const mp3 = page.getByText('MP3 Audio', { exact: true });
+      try {
+        await mp3.waitFor({ timeout: 8000 });
+        await waitMs(2000);
+        await mp3.click({ timeout: 5000 });
+      } catch {
+        logger.info('MP3 Audio flyout not shown; waiting for download or signed URL');
+      }
+
+      const started = Date.now();
+      while (Date.now() - started < 20000) {
+        if (harvested.download) {
+          const dest = audioCachePath(clipId + '.part');
+          await fs.mkdir(AUDIO_CACHE_DIR, { recursive: true });
+          await harvested.download.saveAs(dest);
+          const buffer = await fs.readFile(dest);
+          await fs.unlink(dest).catch(() => {});
+          harvested.download = undefined;
+          if (looksLikeAudio(buffer)) return buffer;
+          logger.info('Browser download was not playable audio, continuing');
+        }
+        if (harvested.signedUrl) {
+          const url = harvested.signedUrl;
+          harvested.signedUrl = undefined;
+          try {
+            const buffer = await fetchBare(url);
+            if (looksLikeAudio(buffer)) return buffer;
+          } catch (err: any) {
+            logger.info('Signed URL fetch failed: ' + err?.message);
+          }
+        }
+        await waitMs(1000);
+      }
+      throw new Error('Playwright harvest did not receive a playable audio file');
+    } finally {
+      closed = true;
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
+    }
   }
 
   public async getPersonaPaginated(personaId: string, page: number = 1): Promise<PersonaResponse> {

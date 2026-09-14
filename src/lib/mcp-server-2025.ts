@@ -4,7 +4,9 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerRequest, ServerNotification } from "@modelcontextprotocol/sdk/types.js";
 import { InMemoryTaskStore, InMemoryTaskMessageQueue } from "@modelcontextprotocol/sdk/experimental/tasks/stores/in-memory.js";
 import { z } from "zod/v4";
-import { DEFAULT_MODEL, sunoApi } from "./SunoApi";
+import { DEFAULT_MODEL, isUnusableAudioUrl, rewriteForbiddenAudioUrls, sunoApi } from "./SunoApi";
+
+type SunoClient = Awaited<ReturnType<typeof sunoApi>>;
 
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
@@ -23,17 +25,70 @@ const taskStore = new InMemoryTaskStore();
 
 // ─── Tool Result Builder ─────────────────────────────────────────────
 
-function buildToolResult(toolResult: unknown): CallToolResult {
+const MAX_EMBED_AUDIO_BYTES = 2 * 1024 * 1024;
+
+function clipMetaText(clip: any): string {
+  return JSON.stringify({
+    id: clip.id,
+    title: clip.title,
+    status: clip.status,
+    duration: clip.duration,
+    audio_url: clip.audio_url,
+  });
+}
+
+async function buildToolResult(
+  toolResult: unknown,
+  opts?: { api?: SunoClient; embedAudio?: boolean }
+): Promise<CallToolResult> {
+  const origin = (process.env.SUNO_PUBLIC_BASE_URL || "").replace(/\/$/, "");
+  toolResult = origin ? rewriteForbiddenAudioUrls(toolResult, origin) : toolResult;
   if (Array.isArray(toolResult) && toolResult.length > 0) {
     const first = toolResult[0];
     if (first && typeof first === "object" && ("audio_url" in first || "video_url" in first)) {
-      const content: CallToolResult["content"] = (toolResult as any[]).flatMap((clip: any) => {
-        const items: CallToolResult["content"] = [];
-        if (clip.title) {
-          items.push({ type: "text" as const, text: `Title: ${clip.title}` });
+      const clips = toolResult as any[];
+      const content: CallToolResult["content"] = [];
+      const readyClips = clips.filter(
+        (clip) => clip.id && clip.status === "complete"
+      );
+      const harvested = new Map<string, { buffer: Buffer; contentType: string } | { error: string }>();
+      if (opts?.embedAudio && opts.api && readyClips.length > 0) {
+        const results = await Promise.all(
+          readyClips.map(async (clip) => {
+            try {
+              const audio = await opts.api!.getPlayableAudio(String(clip.id));
+              return [String(clip.id), audio] as const;
+            } catch (err: any) {
+              return [String(clip.id), { error: err?.message || String(err) }] as const;
+            }
+          })
+        );
+        for (const [id, value] of results) harvested.set(id, value as any);
+      }
+      for (const clip of clips) {
+        content.push({ type: "text" as const, text: clipMetaText(clip) });
+        const audio = clip.id ? harvested.get(String(clip.id)) : undefined;
+        if (audio && "buffer" in audio) {
+          if (audio.buffer.length <= MAX_EMBED_AUDIO_BYTES && audio.contentType.startsWith("audio/")) {
+            content.push({
+              type: "audio" as const,
+              data: audio.buffer.toString("base64"),
+              mimeType: audio.contentType,
+            });
+          } else {
+            content.push({
+              type: "text" as const,
+              text: `Audio for ${clip.id} is ${audio.buffer.length} bytes (${audio.contentType}); too large to embed. Use audio_url if present.`,
+            });
+          }
+        } else if (audio && "error" in audio) {
+          content.push({
+            type: "text" as const,
+            text: `Audio bytes unavailable for ${clip.id}: ${audio.error}`,
+          });
         }
-        if (clip.audio_url) {
-          items.push({
+        if (clip.audio_url && !isUnusableAudioUrl(clip.audio_url)) {
+          content.push({
             type: "resource_link" as const,
             uri: clip.audio_url,
             name: clip.title ? `${clip.title}.mp3` : "audio.mp3",
@@ -41,8 +96,8 @@ function buildToolResult(toolResult: unknown): CallToolResult {
             description: clip.title ? `${clip.title} audio` : "Generated audio",
           });
         }
-        if (clip.video_url) {
-          items.push({
+        if (clip.video_url && !isUnusableAudioUrl(clip.video_url)) {
+          content.push({
             type: "resource_link" as const,
             uri: clip.video_url,
             name: clip.title ? `${clip.title}.mp4` : "video.mp4",
@@ -50,9 +105,12 @@ function buildToolResult(toolResult: unknown): CallToolResult {
             description: clip.title ? `${clip.title} video` : "Generated video",
           });
         }
-        return items;
-      });
-      return { content, isError: false };
+      }
+      return {
+        content,
+        structuredContent: { clips },
+        isError: false,
+      };
     }
   }
 
@@ -132,7 +190,7 @@ async function runGenerationTool(
           String(args.prompt),
           Boolean(args.loop),
           args.model ? String(args.model) : undefined,
-          Boolean(args.wait_audio),
+          args.wait_audio !== false,
           typeof args.tempo === "number" ? args.tempo : undefined,
           args.key ? String(args.key) : undefined
         );
@@ -140,7 +198,8 @@ async function runGenerationTool(
       default:
         return buildToolError(`Unknown generation tool: ${toolName}`);
     }
-    return buildToolResult(result);
+    const embedAudio = toolName === "generate_sound" ? args.wait_audio !== false : Boolean(args.wait_audio);
+    return buildToolResult(result, { api, embedAudio });
   } catch (err: any) {
     return buildToolError(err.message || String(err));
   }
@@ -232,7 +291,7 @@ const GENERATE_SOUND_SCHEMA = {
   prompt: z.string().describe("Text description of the sound effect"),
   loop: z.boolean().optional().describe("Whether the sound should loop"),
   model: z.string().optional().describe("Model name (default: chirp-hawk)"),
-  wait_audio: z.boolean().optional().describe("Wait for generation to complete"),
+  wait_audio: z.boolean().default(true).describe("Defaults to true. Wait until clips are ready and embed playable audio bytes (SFX). Set false to return clip ids immediately."),
   tempo: z.number().optional().describe("BPM of the generated sound effect"),
   key: z.string().optional().describe("Musical key of the generated sound effect"),
 };
@@ -282,7 +341,7 @@ export function createMcpServer(): McpServer {
         args.model ? String(args.model) : DEFAULT_MODEL,
         Boolean(args.wait_audio)
       );
-      return buildToolResult(result);
+      return buildToolResult(result, { api, embedAudio: Boolean(args.wait_audio) });
     }
   );
 
@@ -308,7 +367,7 @@ export function createMcpServer(): McpServer {
         Boolean(args.wait_audio),
         args.negative_tags ? String(args.negative_tags) : undefined
       );
-      return buildToolResult(result);
+      return buildToolResult(result, { api, embedAudio: Boolean(args.wait_audio) });
     }
   );
 
@@ -335,7 +394,7 @@ export function createMcpServer(): McpServer {
         args.model ? String(args.model) : undefined,
         Boolean(args.wait_audio)
       );
-      return buildToolResult(result);
+      return buildToolResult(result, { api, embedAudio: Boolean(args.wait_audio) });
     }
   );
 
@@ -436,15 +495,16 @@ export function createMcpServer(): McpServer {
     async (args: any, extra: ToolExtra) => {
       const cookies = getSessionCookies(extra.sessionId);
       const api = await sunoApi(cookies);
+      const waitAudio = args.wait_audio !== false;
       const result = await api.generateSound(
         String(args.prompt),
         Boolean(args.loop),
         args.model ? String(args.model) : undefined,
-        Boolean(args.wait_audio),
+        waitAudio,
         typeof args.tempo === "number" ? args.tempo : undefined,
         args.key ? String(args.key) : undefined
       );
-      return buildToolResult(result);
+      return buildToolResult(result, { api, embedAudio: waitAudio });
     }
   );
 

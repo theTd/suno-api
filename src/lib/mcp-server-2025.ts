@@ -49,14 +49,14 @@ async function buildToolResult(
       const clips = toolResult as any[];
       const content: CallToolResult["content"] = [];
       const readyClips = clips.filter(
-        (clip) => clip.id && clip.status === "complete"
+        (clip) => clip.id && (clip.status === "complete" || clip.status === "streaming")
       );
       const harvested = new Map<string, { buffer: Buffer; contentType: string } | { error: string }>();
       if (opts?.embedAudio && opts.api && readyClips.length > 0) {
         const results = await Promise.all(
           readyClips.map(async (clip) => {
             try {
-              const audio = await opts.api!.getPlayableAudio(String(clip.id));
+              const audio = await opts.api!.getPreviewAudio(String(clip.id));
               return [String(clip.id), audio] as const;
             } catch (err: any) {
               return [String(clip.id), { error: err?.message || String(err) }] as const;
@@ -91,9 +91,9 @@ async function buildToolResult(
           content.push({
             type: "resource_link" as const,
             uri: clip.audio_url,
-            name: clip.title ? `${clip.title}.mp3` : "audio.mp3",
-            mimeType: "audio/mpeg",
-            description: clip.title ? `${clip.title} audio` : "Generated audio",
+            name: clip.title ? `${clip.title}.m4a` : "preview.m4a",
+            mimeType: "audio/mp4",
+            description: clip.title ? `${clip.title} preview (no unlock)` : "Preview audio (no unlock)",
           });
         }
         if (clip.video_url && !isUnusableAudioUrl(clip.video_url)) {
@@ -508,7 +508,48 @@ export function createMcpServer(): McpServer {
     }
   );
 
-  // ─── Tool 9: generate_stems ────────────────────────────────────────
+  // ─── Tool 9: download_audio ────────────────────────────────────────
+  server.registerTool(
+    "download_audio",
+    {
+      title: "Unlock & Download Audio",
+      description:
+        "Unlock a completed clip and download the master file. Consumes a Premier download credit if the clip is not already unlocked. Use after previewing.",
+      inputSchema: {
+        clip_id: z.string().describe("ID of the clip to unlock and download"),
+      },
+      annotations: GENERATION_ANNOTATIONS,
+    },
+    async (args: any, extra: ToolExtra) => {
+      const cookies = getSessionCookies(extra.sessionId);
+      const api = await sunoApi(cookies);
+      const clipId = String(args.clip_id);
+      try {
+        const { buffer, contentType } = await api.getPlayableAudio(clipId);
+        const origin = (process.env.SUNO_PUBLIC_BASE_URL || "").replace(/\/$/, "");
+        const content: CallToolResult["content"] = [
+          { type: "text", text: JSON.stringify({ id: clipId, unlocked: true, bytes: buffer.length, contentType }) },
+        ];
+        if (buffer.length <= MAX_EMBED_AUDIO_BYTES && contentType.startsWith("audio/")) {
+          content.push({ type: "audio", data: buffer.toString("base64"), mimeType: contentType });
+        }
+        if (origin) {
+          content.push({
+            type: "resource_link",
+            uri: `${origin}/api/file/${clipId}`,
+            name: `${clipId}.mp3`,
+            mimeType: contentType,
+            description: "Unlocked master download",
+          });
+        }
+        return { content, isError: false };
+      } catch (err: any) {
+        return buildToolError(err?.message || String(err));
+      }
+    }
+  );
+
+  // ─── Tool 10: generate_stems ────────────────────────────────────────
   server.registerTool(
     "generate_stems",
     {
@@ -528,7 +569,7 @@ export function createMcpServer(): McpServer {
     }
   );
 
-  // ─── Tool 10: get_aligned_lyrics ───────────────────────────────────
+  // ─── Tool 11: get_aligned_lyrics ───────────────────────────────────
   server.registerTool(
     "get_aligned_lyrics",
     {

@@ -21,12 +21,16 @@ globalForSunoApi.sunoApiCache = cache;
 const logger = pino();
 export const DEFAULT_MODEL = 'chirp-hawk';
 const AUDIO_CACHE_DIR = path.join(os.tmpdir(), 'suno-audio-cache');
+const PREVIEW_CACHE_DIR = path.join(os.tmpdir(), 'suno-preview-cache');
 const globalForHarvest = global as unknown as {
   sunoAudioHarvest?: Map<string, Promise<Buffer>>;
+  sunoPreviewHarvest?: Map<string, Promise<Buffer>>;
   sunoPlaywrightHarvest?: Promise<unknown>;
 };
 const harvestLocks = globalForHarvest.sunoAudioHarvest || new Map<string, Promise<Buffer>>();
 globalForHarvest.sunoAudioHarvest = harvestLocks;
+const previewLocks = globalForHarvest.sunoPreviewHarvest || new Map<string, Promise<Buffer>>();
+globalForHarvest.sunoPreviewHarvest = previewLocks;
 if (!globalForHarvest.sunoPlaywrightHarvest)
   globalForHarvest.sunoPlaywrightHarvest = Promise.resolve();
 
@@ -49,7 +53,7 @@ export function rewriteForbiddenAudioUrls<T>(data: T, origin: string): T {
     if (!clip || typeof clip !== 'object' || !clip.id) return clip;
     const ready = clip.status === 'complete' || clip.status === 'streaming';
     if (ready && isUnusableAudioUrl(clip.audio_url))
-      return { ...clip, audio_url: `${base}/api/file/${clip.id}` };
+      return { ...clip, audio_url: `${base}/api/preview/${clip.id}` };
     return clip;
   };
   if (Array.isArray(data)) return data.map(rewriteClip) as T;
@@ -69,6 +73,10 @@ function looksLikeAudio(buf: Buffer): boolean {
 
 function audioCachePath(clipId: string): string {
   return path.join(AUDIO_CACHE_DIR, `${clipId}.bin`);
+}
+
+function previewCachePath(clipId: string): string {
+  return path.join(PREVIEW_CACHE_DIR, `${clipId}.bin`);
 }
 
 function waitMs(ms: number): Promise<void> {
@@ -1322,6 +1330,29 @@ class SunoApi {
     }
   }
 
+  /**
+   * Capture the in-player preview (no Premier unlock / no download credit).
+   * Hooks MSE appendBuffer while the Studio page plays the clip.
+   */
+  public async getPreviewAudio(clipId: string): Promise<{ buffer: Buffer; contentType: string }> {
+    let pending = previewLocks.get(clipId);
+    if (!pending) {
+      pending = (async () => {
+        const cached = await this.readPreviewCache(clipId);
+        if (cached) return cached.buffer;
+        return this.harvestPreviewAudio(clipId);
+      })();
+      previewLocks.set(clipId, pending);
+    }
+    try {
+      const buffer = await pending;
+      return { buffer, contentType: this.sniffAudioType(buffer) };
+    } finally {
+      if (previewLocks.get(clipId) === pending)
+        previewLocks.delete(clipId);
+    }
+  }
+
   private sniffAudioType(buffer: Buffer): string {
     if (buffer.subarray(0, 3).toString() === 'ID3') return 'audio/mpeg';
     if (buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0) return 'audio/mpeg';
@@ -1348,6 +1379,166 @@ class SunoApi {
     const tmp = dest + '.tmp';
     await fs.writeFile(tmp, buffer);
     await fs.rename(tmp, dest);
+  }
+
+  private async readPreviewCache(clipId: string): Promise<{ buffer: Buffer; contentType: string } | null> {
+    try {
+      const buffer = await fs.readFile(previewCachePath(clipId));
+      if (!looksLikeAudio(buffer)) return null;
+      return { buffer, contentType: this.sniffAudioType(buffer) };
+    } catch {
+      return null;
+    }
+  }
+
+  private async writePreviewCache(clipId: string, buffer: Buffer): Promise<void> {
+    await fs.mkdir(PREVIEW_CACHE_DIR, { recursive: true });
+    const dest = previewCachePath(clipId);
+    const tmp = dest + '.tmp';
+    await fs.writeFile(tmp, buffer);
+    await fs.rename(tmp, dest);
+  }
+
+  private async harvestPreviewAudio(clipId: string): Promise<Buffer> {
+    let clipStatus: string | undefined;
+    let durationSec: number | undefined;
+    try {
+      const clips = await this.get([clipId]);
+      clipStatus = clips[0]?.status;
+      const rawDuration = Number(clips[0]?.duration);
+      if (Number.isFinite(rawDuration) && rawDuration > 0)
+        durationSec = rawDuration;
+    } catch (err: any) {
+      throw new ClipAudioNotReadyError('Clip status unavailable');
+    }
+    if (clipStatus !== 'complete' && clipStatus !== 'streaming')
+      throw new ClipAudioNotReadyError('Clip is not ready for preview');
+    logger.info('Capturing in-player preview (no unlock): ' + clipId);
+    const previous = globalForHarvest.sunoPlaywrightHarvest || Promise.resolve();
+    let release!: () => void;
+    globalForHarvest.sunoPlaywrightHarvest = new Promise<void>((resolve) => { release = resolve; });
+    await previous.catch(() => {});
+    try {
+      const harvested = await this.capturePreviewViaBrowser(
+        clipId,
+        durationSec
+      );
+      if (clipStatus === 'complete')
+        await this.writePreviewCache(clipId, harvested);
+      return harvested;
+    } finally {
+      release();
+    }
+  }
+
+  private async capturePreviewViaBrowser(clipId: string, clipDurationSec?: number): Promise<Buffer> {
+    const { browser, context } = await this.launchBrowser();
+    try {
+      await context.addInitScript(() => {
+        (window as any).__sunoMse = { chunks: [] as number[][], bytes: 0, hooked: false };
+        const hook = () => {
+          const store = (window as any).__sunoMse;
+          if (!store || store.hooked || !(window as any).MediaSource) return;
+          store.hooked = true;
+          const origAdd = MediaSource.prototype.addSourceBuffer;
+          MediaSource.prototype.addSourceBuffer = function (mime: string) {
+            const sb = origAdd.call(this, mime);
+            if (!/audio/i.test(mime || '')) return sb;
+            const origAppend = sb.appendBuffer;
+            sb.appendBuffer = function (data: BufferSource) {
+              try {
+                const src = data instanceof ArrayBuffer
+                  ? new Uint8Array(data)
+                  : new Uint8Array((data as Uint8Array).buffer, (data as Uint8Array).byteOffset, (data as Uint8Array).byteLength);
+                store.chunks.push(Array.from(src));
+                store.bytes += src.length;
+              } catch {
+                // ignore copy failures; still append
+              }
+              return origAppend.call(this, data);
+            };
+            return sb;
+          };
+        };
+        hook();
+        document.addEventListener('DOMContentLoaded', hook);
+      });
+      const page = await context.newPage();
+      await page.goto(`https://suno.com/song/${clipId}`, {
+        referer: 'https://suno.com/',
+        waitUntil: 'domcontentloaded',
+        timeout: 20000
+      });
+      await this.dismissOverlays(page);
+      await page.getByRole('button', { name: 'Edit', exact: true }).waitFor({ timeout: 20000 }).catch(() => {});
+      await this.dismissOverlays(page);
+
+      const startedPlayback = await page.evaluate(async () => {
+        const media = [...document.querySelectorAll('audio, video')] as HTMLMediaElement[];
+        for (const a of media) {
+          try { await a.play(); } catch { /* autoplay may be blocked until a gesture */ }
+        }
+        return media.some((a) => !a.paused);
+      }).catch(() => false);
+      if (!startedPlayback) {
+        await page.getByRole('button', { name: /play/i }).first().click({ timeout: 5000 }).catch(() => {});
+        await page.keyboard.press('Space').catch(() => {});
+      }
+
+      const targetSec = Math.min(clipDurationSec && clipDurationSec > 0 ? clipDurationSec : 20, 20);
+      const deadline = Date.now() + Math.min(90000, targetSec * 1000 + 15000);
+      let playback: { t: number; d: number; ended: boolean; paused: boolean; bytes: number } | null = null;
+      while (Date.now() < deadline) {
+        playback = await page.evaluate(() => {
+          const store = (window as any).__sunoMse;
+          const media = [...document.querySelectorAll('audio, video')] as HTMLMediaElement[];
+          const a = media.find((el) => el.currentTime > 0 || !el.paused) || media[0];
+          return {
+            t: a ? a.currentTime : 0,
+            d: a && Number.isFinite(a.duration) ? a.duration : 0,
+            ended: !!(a && a.ended),
+            paused: !a || a.paused,
+            bytes: store?.bytes || 0
+          };
+        }).catch(() => null);
+        if (playback && playback.t > 0.2 && playback.paused)
+          await page.evaluate(async () => {
+            for (const a of document.querySelectorAll('audio, video') as NodeListOf<HTMLMediaElement>) {
+              try { await a.play(); } catch {}
+            }
+          }).catch(() => {});
+        if (playback && playback.bytes > 3000 && (playback.ended || playback.t >= targetSec * 0.9))
+          break;
+        await waitMs(500);
+      }
+      if (!playback || playback.t < 0.2 || playback.bytes < 3000)
+        throw new Error('Preview playback never started or captured too little audio');
+      if (!playback.ended && playback.t < targetSec * 0.9)
+        throw new Error('Preview capture stopped before end of listen window');
+
+      const packed = await page.evaluate(() => {
+        const store = (window as any).__sunoMse || { chunks: [] as number[][] };
+        const chunks: number[][] = store.chunks || [];
+        const total = chunks.reduce((s, c) => s + c.length, 0);
+        const out = new Uint8Array(total);
+        let o = 0;
+        for (const c of chunks) {
+          out.set(c, o);
+          o += c.length;
+        }
+        let bin = '';
+        for (let i = 0; i < out.length; i += 0x8000)
+          bin += String.fromCharCode.apply(null, Array.from(out.subarray(i, i + 0x8000)));
+        return { total, b64: btoa(bin) };
+      });
+      const buffer = Buffer.from(packed.b64, 'base64');
+      if (!looksLikeAudio(buffer))
+        throw new Error('Preview capture did not produce playable audio');
+      return buffer;
+    } finally {
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
+    }
   }
 
   private async harvestPlayableAudio(clipId: string): Promise<Buffer> {

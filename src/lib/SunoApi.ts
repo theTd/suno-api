@@ -59,8 +59,15 @@ interface PreviewJob {
   currentSec: number;
   durationSec: number;
   bytes: number;
+  /**
+   * Every chunk captured so far, in append order. Index IS the sequence
+   * number handed to chunk subscribers, so late joiners can replay the
+   * prefix (including the container init segment) before joining the live
+   * tail. Bounded by one song (~10-20MB) per active job.
+   */
+  chunkLog: Buffer[];
   /** Progressive-capture subscribers (protocol-layer streaming). */
-  chunkSubs?: Set<(chunk: Buffer) => void>;
+  chunkSubs?: Set<(chunk: Buffer, seq: number) => void>;
   endSubs?: Set<() => void>;
   errSubs?: Set<(err: Error) => void>;
 }
@@ -1691,7 +1698,8 @@ class SunoApi {
       phase: 'waiting_clip',
       currentSec: 0,
       durationSec: 0,
-      bytes: 0
+      bytes: 0,
+      chunkLog: []
     };
     job.promise = this.runPreviewJob(clipId, job);
     // Errors are surfaced through previewJobStatus(); never crash the process.
@@ -1723,10 +1731,10 @@ class SunoApi {
 
   // ─── Progressive Preview Streaming (protocol layer) ─────────────────
 
-  private emitPreviewChunk(job: PreviewJob, chunk: Buffer): void {
+  private emitPreviewChunk(job: PreviewJob, chunk: Buffer, seq: number): void {
     for (const fn of job.chunkSubs ?? []) {
       try {
-        fn(chunk);
+        fn(chunk, seq);
       } catch {
         // A misbehaving subscriber must never break the capture.
       }
@@ -1755,6 +1763,18 @@ class SunoApi {
   }
 
   /**
+   * Begin or join the harvest for a clip, dropping a stale errored job first
+   * (a failed job is kept visible to status pollers for PREVIEW_ERROR_TTL_MS;
+   * a fresh subscriber wants a retry, not the stale error).
+   */
+  private acquirePreviewJob(clipId: string): PreviewJob {
+    const stale = previewJobs.get(clipId);
+    if (stale && stale.phase === 'error' && previewJobs.get(clipId) === stale)
+      previewJobs.delete(clipId);
+    return this.beginPreviewHarvest(clipId);
+  }
+
+  /**
    * Subscribe to progressively captured preview chunks.
    * `onChunk` fires in capture order as MSE segments are appended (before the
    * capture as a whole finishes); `onEnd` when the capture completed; `onError`
@@ -1768,17 +1788,13 @@ class SunoApi {
     onEnd: () => void,
     onError: (err: Error) => void
   ): () => void {
-    // A failed job is kept visible to status pollers for PREVIEW_ERROR_TTL_MS;
-    // a fresh subscriber wants a retry, not the stale error.
-    const stale = previewJobs.get(clipId);
-    if (stale && stale.phase === 'error' && previewJobs.get(clipId) === stale)
-      previewJobs.delete(clipId);
-    const job = this.beginPreviewHarvest(clipId);
-    (job.chunkSubs ??= new Set()).add(onChunk);
+    const job = this.acquirePreviewJob(clipId);
+    const wrapped = (chunk: Buffer) => onChunk(chunk);
+    (job.chunkSubs ??= new Set()).add(wrapped);
     (job.endSubs ??= new Set()).add(onEnd);
     (job.errSubs ??= new Set()).add(onError);
     return () => {
-      job.chunkSubs?.delete(onChunk);
+      job.chunkSubs?.delete(wrapped);
       job.endSubs?.delete(onEnd);
       job.errSubs?.delete(onError);
     };
@@ -1815,37 +1831,40 @@ class SunoApi {
       // Push-driven: chunks arrive from the capture loop at ~500ms cadence,
       // so read() backpressure is irrelevant at this rate.
       const stream = new Readable({ read() {} });
-      const unsubscribe = this.subscribePreviewChunks(
-        clipId,
-        (chunk) => {
-          if (!settled) {
-            settled = true;
-            signal?.removeEventListener('abort', onAbort);
-            resolve({ stream, contentType: this.sniffAudioType(chunk) });
-          }
-          stream.push(chunk);
-        },
-        () => {
+      const job = this.acquirePreviewJob(clipId);
+      // Sequence number of the next chunk the stream must deliver. Chunks
+      // with a lower seq were already delivered via the log replay below.
+      let nextSeq = 0;
+      const onChunk = (chunk: Buffer, seq: number) => {
+        if (seq < nextSeq) return;
+        nextSeq = seq + 1;
+        if (!settled) {
+          settled = true;
           signal?.removeEventListener('abort', onAbort);
-          if (!settled) {
-            // Capture ended without emitting any chunk (harvest normally
-            // throws in that case, so this is just a defensive fallback).
-            settled = true;
-            resolve({ stream, contentType: 'application/octet-stream' });
-          }
-          stream.push(null);
-        },
-        (err) => {
-          unsubscribe();
-          signal?.removeEventListener('abort', onAbort);
-          if (!settled) {
-            settled = true;
-            reject(err);
-          } else {
-            stream.destroy(err);
-          }
+          resolve({ stream, contentType: this.sniffAudioType(chunk) });
         }
-      );
+        stream.push(chunk);
+      };
+      const onEnd = () => {
+        signal?.removeEventListener('abort', onAbort);
+        if (!settled) {
+          // Capture ended without emitting any chunk (harvest normally
+          // throws in that case, so this is just a defensive fallback).
+          settled = true;
+          resolve({ stream, contentType: 'application/octet-stream' });
+        }
+        stream.push(null);
+      };
+      const onError = (err: Error) => {
+        unsubscribe();
+        signal?.removeEventListener('abort', onAbort);
+        if (!settled) {
+          settled = true;
+          reject(err);
+        } else {
+          stream.destroy(err);
+        }
+      };
       const onAbort = () => {
         unsubscribe();
         if (!settled) {
@@ -1855,6 +1874,18 @@ class SunoApi {
           stream.destroy();
         }
       };
+      (job.chunkSubs ??= new Set()).add(onChunk);
+      (job.endSubs ??= new Set()).add(onEnd);
+      (job.errSubs ??= new Set()).add(onError);
+      const unsubscribe = () => {
+        job.chunkSubs?.delete(onChunk);
+        job.endSubs?.delete(onEnd);
+        job.errSubs?.delete(onError);
+      };
+      // Late join: replay the prefix captured before we attached so the
+      // stream starts with the container init segment and is demuxable.
+      // The loop is synchronous, so no live emit can interleave with it.
+      for (let i = 0; i < job.chunkLog.length; i++) onChunk(job.chunkLog[i], i);
       signal?.addEventListener('abort', onAbort, { once: true });
       // Drop the job subscription when the consumer (HTTP client) goes away.
       stream.once('close', unsubscribe);
@@ -2099,7 +2130,10 @@ class SunoApi {
         if (drained && drained.total > 0) {
           const chunk = Buffer.from(drained.b64, 'base64');
           collected.push(chunk);
-          if (job) this.emitPreviewChunk(job, chunk);
+          if (job) {
+            job.chunkLog.push(chunk);
+            this.emitPreviewChunk(job, chunk, job.chunkLog.length - 1);
+          }
         }
         if (playback && job) {
           job.currentSec = playback.t;
@@ -2122,7 +2156,14 @@ class SunoApi {
         throw new Error('Preview capture stopped before end of listen window');
 
       const packed = await page.evaluate(drainMseChunkPayload).catch(() => null);
-      if (packed && packed.total > 0) collected.push(Buffer.from(packed.b64, 'base64'));
+      if (packed && packed.total > 0) {
+        const chunk = Buffer.from(packed.b64, 'base64');
+        collected.push(chunk);
+        if (job) {
+          job.chunkLog.push(chunk);
+          this.emitPreviewChunk(job, chunk, job.chunkLog.length - 1);
+        }
+      }
       const buffer = Buffer.concat(collected);
       if (!looksLikeAudio(buffer))
         throw new Error('Preview capture did not produce playable audio');

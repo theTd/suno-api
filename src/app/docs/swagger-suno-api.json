@@ -874,7 +874,7 @@
     "/api/preview/{id}": {
       "get": {
         "summary": "Get or stream a clip's in-player preview (no unlock / no download credit).",
-        "description": "Without `stream`: returns the captured preview binary when ready, otherwise 202 with harvest status (poll with Retry-After). With `?stream=1`: opens a progressive chunked audio stream that starts flowing while the in-browser capture is still running, so an unfinished track can be previewed immediately. The response has no Content-Length; the stream ends when the capture completes. Content-Type is sniffed from the first captured chunk (e.g. audio/webm, audio/mp4).",
+        "description": "Without `stream`: returns the captured preview binary when ready (supports HTTP Range requests for seeking via 206/Content-Range), otherwise 202 with harvest status (poll with Retry-After). With `?stream=1`: opens a progressive chunked audio stream that starts flowing while the in-browser capture is still running, so an unfinished track can be previewed immediately; late joiners receive the capture from its first chunk (including the container init segment). A live stream is linear (Accept-Ranges: none): seek forward is unavailable until the capture completes and is served with Range support. Content-Type is sniffed from the first chunk (e.g. audio/webm, audio/mp4).",
         "tags": ["default"],
         "parameters": [
           {

@@ -33,6 +33,9 @@ export async function GET(
         headers: {
           'Content-Type': contentType,
           'Content-Disposition': `inline; filename="${clipId}-preview"`,
+          // A live capture is a linear stream: it cannot serve arbitrary byte
+          // ranges, so tell the player not to attempt range-based seeking.
+          'Accept-Ranges': 'none',
           // Never buffer/transform a stream that is still growing.
           'Cache-Control': 'no-cache, no-transform',
           'X-Accel-Buffering': 'no',
@@ -51,11 +54,41 @@ export async function GET(
           : cached.contentType.includes('mp4')
             ? 'm4a'
             : 'mp3';
+      const total = cached.buffer.length;
+
+      // Range support: media elements seek by re-requesting byte ranges.
+      const range = req.headers.get('range');
+      const match = range ? /^bytes=(\d+)-(\d*)$/.exec(range.trim()) : null;
+      if (match) {
+        const start = parseInt(match[1], 10);
+        const end = match[2] ? Math.min(parseInt(match[2], 10), total - 1) : total - 1;
+        if (start >= total) {
+          return new Response(null, {
+            status: 416,
+            headers: { 'Content-Range': `bytes */${total}`, ...corsHeaders }
+          });
+        }
+        const slice = cached.buffer.subarray(start, end + 1);
+        return new NextResponse(Uint8Array.from(slice), {
+          status: 206,
+          headers: {
+            'Content-Type': cached.contentType,
+            'Content-Length': String(slice.length),
+            'Content-Range': `bytes ${start}-${end}/${total}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Disposition': `inline; filename="${clipId}-preview.${ext}"`,
+            'Cache-Control': 'private, max-age=60',
+            ...corsHeaders
+          }
+        });
+      }
+
       return new NextResponse(Uint8Array.from(cached.buffer), {
         status: 200,
         headers: {
           'Content-Type': cached.contentType,
-          'Content-Length': String(cached.buffer.length),
+          'Content-Length': String(total),
+          'Accept-Ranges': 'bytes',
           'Content-Disposition': `inline; filename="${clipId}-preview.${ext}"`,
           'Cache-Control': 'private, max-age=60',
           ...corsHeaders

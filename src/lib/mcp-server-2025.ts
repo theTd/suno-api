@@ -339,7 +339,8 @@ export function createMcpServer(): McpServer {
         String(args.prompt),
         Boolean(args.make_instrumental),
         args.model ? String(args.model) : DEFAULT_MODEL,
-        Boolean(args.wait_audio)
+        Boolean(args.wait_audio),
+        extra.signal
       );
       return buildToolResult(result, { api, embedAudio: Boolean(args.wait_audio) });
     }
@@ -365,7 +366,8 @@ export function createMcpServer(): McpServer {
         Boolean(args.make_instrumental),
         args.model ? String(args.model) : DEFAULT_MODEL,
         Boolean(args.wait_audio),
-        args.negative_tags ? String(args.negative_tags) : undefined
+        args.negative_tags ? String(args.negative_tags) : undefined,
+        extra.signal
       );
       return buildToolResult(result, { api, embedAudio: Boolean(args.wait_audio) });
     }
@@ -392,7 +394,8 @@ export function createMcpServer(): McpServer {
         args.negative_tags ? String(args.negative_tags) : "",
         args.title ? String(args.title) : "",
         args.model ? String(args.model) : undefined,
-        Boolean(args.wait_audio)
+        Boolean(args.wait_audio),
+        extra.signal
       );
       return buildToolResult(result, { api, embedAudio: Boolean(args.wait_audio) });
     }
@@ -502,7 +505,8 @@ export function createMcpServer(): McpServer {
         args.model ? String(args.model) : undefined,
         waitAudio,
         typeof args.tempo === "number" ? args.tempo : undefined,
-        args.key ? String(args.key) : undefined
+        args.key ? String(args.key) : undefined,
+        extra.signal
       );
       return buildToolResult(result, { api, embedAudio: waitAudio });
     }

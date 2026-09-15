@@ -250,11 +250,13 @@ export interface GenerateSongsOptions {
 /** Context values resolved by the SunoApi instance at request time. */
 export interface GeneratePayloadContext {
   captchaToken: string | null;
-  captchaTokenProvider?: string;
+  captchaTokenProvider?: string | number;
   /** plan id from the Clerk session JWT (without the ':interval' suffix). */
   userTier?: string;
   /** Stable per-instance UUID mimicking the web client's create_session_token. */
   createSessionToken: string;
+  /** Reuse the browser generate request's transaction id when a captcha token was minted against it. */
+  transactionUuid?: string;
 }
 
 /**
@@ -332,7 +334,7 @@ export function buildGenerateV2Payload(options: GenerateSongsOptions, ctx: Gener
     continue_clip_id: options.continue_clip_id ?? null,
     continued_aligned_prompt: null,
     continue_at: options.continue_at ?? null,
-    transaction_uuid: randomUUID(),
+    transaction_uuid: ctx.transactionUuid || randomUUID(),
     token_provider: ctx.captchaTokenProvider ?? null
   };
   // The official client only sends `task` for non-custom generations.
@@ -364,6 +366,30 @@ export function buildGenerateV2Payload(options: GenerateSongsOptions, ctx: Gener
     payload.gpt_description_prompt = options.prompt;
   }
   return payload;
+}
+
+/**
+ * Overlay captcha-bound fields from the browser's intercepted generate POST
+ * onto a freshly built v2-web payload. The widget token is minted against
+ * that browser request's session/transaction, not a later Node axios replay.
+ */
+export function bindCaptchaGeneratePayload(payload: any, intercepted: any): any {
+  if (!payload || typeof payload !== 'object')
+    return payload;
+  const next = {
+    ...payload,
+    metadata: { ...(payload.metadata || {}) }
+  };
+  if (intercepted?.token)
+    next.token = intercepted.token;
+  if (intercepted?.token_provider != null)
+    next.token_provider = intercepted.token_provider;
+  if (typeof intercepted?.transaction_uuid === 'string' && intercepted.transaction_uuid)
+    next.transaction_uuid = intercepted.transaction_uuid;
+  const sessionToken = intercepted?.metadata?.create_session_token;
+  if (typeof sessionToken === 'string' && sessionToken)
+    next.metadata.create_session_token = sessionToken;
+  return next;
 }
 
 interface PersonaResponse {
@@ -402,8 +428,11 @@ class SunoApi {
   private readonly client: AxiosInstance;
   private sid?: string;
   private currentToken?: string;
-  private captchaTokenProvider?: string;
+  private captchaTokenProvider?: string | number;
   private createSessionToken?: string;
+  private captchaTransactionUuid?: string;
+  private captchaBrowserClips?: any[];
+  private captchaBrowserError?: string;
   private deviceId?: string;
   private userAgent?: string;
   private cookies: Record<string, string | undefined>;
@@ -666,10 +695,21 @@ class SunoApi {
    * Checks for CAPTCHA verification and solves the CAPTCHA if needed.
    * Suno currently serves Cloudflare Turnstile (captcha_version 2) and may
    * still fall back to hCaptcha (version 1).
+   *
+   * When `submitOptions` is provided, the intercepted browser generate is
+   * rewritten to the real payload and sent from Chromium (same TLS/JWT as
+   * the widget). Axios must not replay that one-time token afterwards.
    * @returns {string|null} Captcha token. If no verification is required, returns null
    */
-  public async getCaptcha(engage: () => void = () => {}, signal?: AbortSignal): Promise<string|null> {
+  public async getCaptcha(
+    engage: () => void = () => {},
+    signal?: AbortSignal,
+    submitOptions?: GenerateSongsOptions
+  ): Promise<string|null> {
     this.captchaTokenProvider = undefined;
+    this.captchaTransactionUuid = undefined;
+    this.captchaBrowserClips = undefined;
+    this.captchaBrowserError = undefined;
     if (!await this.captchaRequired())
       return null;
 
@@ -724,6 +764,7 @@ class SunoApi {
 
       let tokenSettled = false;
       const tokenPromise = new Promise<string>((resolve, reject) => {
+        let capturedToken: string | undefined;
         const onAbort = () => {
           if (!tokenSettled) {
             tokenSettled = true;
@@ -751,17 +792,78 @@ class SunoApi {
               route.abort();
               return;
             }
-            if (postData?.token_provider)
+            capturedToken = token;
+            tokenSettled = true;
+            if (postData?.token_provider != null)
               this.captchaTokenProvider = postData.token_provider;
-            this.currentToken = request.headers().authorization?.split('Bearer ').pop();
+            const bearer = request.headers().authorization?.split('Bearer ').pop();
+            if (bearer)
+              this.currentToken = bearer;
             logger.info('Captured generate captcha token from ' + request.url());
             controller.signal.removeEventListener('abort', onAbort);
-            tokenSettled = true;
+
+            if (!submitOptions) {
+              resolve(token);
+              route.abort();
+              return;
+            }
+
+            const sessionToken =
+              postData?.metadata?.create_session_token
+              || this.createSessionToken
+              || randomUUID();
+            const payload = bindCaptchaGeneratePayload(
+              buildGenerateV2Payload(submitOptions, {
+                captchaToken: token,
+                captchaTokenProvider: this.captchaTokenProvider,
+                userTier: extractUserTierFromJwt(this.currentToken),
+                createSessionToken: sessionToken,
+                transactionUuid: postData?.transaction_uuid
+              }),
+              postData
+            );
+            this.createSessionToken = payload.metadata?.create_session_token || sessionToken;
+            this.captchaTransactionUuid = payload.transaction_uuid;
+            logger.info('Submitting generate via browser intercept (same TLS/JWT as captcha)');
+            // waitForResponse (not request.response()): the latter returns null
+            // immediately if the response has not arrived yet and does not wait.
+            // Attach catch before continue so a failed continue cannot leave an
+            // unhandled rejection when the page later closes.
+            const responsePromise = page.waitForResponse(
+              (resp) => resp.request() === request,
+              { timeout: 20000 }
+            );
+            const pendingResponse = responsePromise.catch(() => null);
+            await route.continue({ postData: JSON.stringify(payload) });
+            const response = await pendingResponse;
+            if (!response)
+              throw new Error('Browser generate produced no response');
+            const body = await response.text();
+            let clips: any[] | undefined;
+            try {
+              const parsed = JSON.parse(body);
+              if (Array.isArray(parsed?.clips))
+                clips = parsed.clips;
+            } catch {}
+            if (clips && clips.length > 0) {
+              this.captchaBrowserClips = clips;
+              logger.info('Browser generate accepted ' + clips.length + ' clip(s)');
+            } else {
+              const snippet = body.replace(/\s+/g, ' ').slice(0, 240);
+              this.captchaBrowserError =
+                'Suno rejected the captcha-backed generate (' + response.status() + '): ' + snippet;
+              logger.warn(this.captchaBrowserError);
+            }
             resolve(token);
-            route.abort();
           } catch(err) {
             route.abort().catch(() => {});
             logger.warn('Generate intercept error: ' + (err as Error).message);
+            if (tokenSettled) {
+              if (!this.captchaBrowserClips && !this.captchaBrowserError)
+                this.captchaBrowserError = 'Browser generate fetch failed: ' + (err as Error).message;
+              if (capturedToken)
+                resolve(capturedToken);
+            }
           }
         };
         page.route(generateRoute, routeHandler);
@@ -1099,9 +1201,15 @@ class SunoApi {
     const MAX_CAPTCHA_ATTEMPTS = 3;
 
     for (let attempt = 0; attempt < MAX_CAPTCHA_ATTEMPTS; attempt++) {
+      if (signal.aborted)
+        throw new Error('AbortError');
       logger.info(`hCaptcha attempt ${attempt + 1}/${MAX_CAPTCHA_ATTEMPTS}`);
       const visible = await challenge.isVisible({ timeout: 4000 }).catch(() => false);
       if (!visible) {
+        if (attempt > 0) {
+          logger.info('hCaptcha challenge gone after previous submit');
+          return;
+        }
         logger.info('hCaptcha challenge not open; clicking checkbox');
         const checkbox = frame.locator('#checkbox, .checkbox');
         await checkbox.first().click({ timeout: 8000 }).catch((e: any) => {
@@ -1113,8 +1221,8 @@ class SunoApi {
           throw new Error('hCaptcha challenge did not open within 15s');
         }
       }
-      await waitForRequests(page, signal, 30000);
-      await sleep(2, 3); // Allow challenge images to fully render before screenshot
+      await waitForRequests(page, signal, 45000);
+      await sleep(3, 3); // Allow challenge images to fully render before screenshot
 
       const promptText = await challenge.locator('.prompt-text')
         .first().innerText().catch(() => '');
@@ -1182,13 +1290,40 @@ class SunoApi {
       } catch (e: any) {
         if (e.message.includes('viewport')) {
           await this.click(button);
+        } else if (!await challenge.isVisible().catch(() => false)) {
+          logger.info('hCaptcha submit skipped; challenge already closed');
+          return;
         } else {
           throw e;
         }
       }
+
+      const outcome = await this.waitForHcaptchaOutcome(challenge, signal, 8000);
+      if (outcome === 'passed') {
+        logger.info('hCaptcha passed after attempt ' + (attempt + 1));
+        return;
+      }
+      logger.info('hCaptcha still visible after submit; retrying');
     }
 
     throw new Error('hCaptcha max attempts exceeded');
+  }
+
+  private async waitForHcaptchaOutcome(
+    challenge: Locator,
+    signal: AbortSignal,
+    timeoutMs: number
+  ): Promise<'passed' | 'retry'> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (signal.aborted)
+        throw new Error('AbortError');
+      const visible = await challenge.isVisible().catch(() => false);
+      if (!visible)
+        return 'passed';
+      await sleep(0.4, 0.4);
+    }
+    return 'retry';
   }
 
   /**
@@ -1313,9 +1448,20 @@ class SunoApi {
     const clips = await this.captchaGate.run(async (engage) => {
       try {
         await this.keepAlive();
-        const captchaToken = await this.getCaptcha(engage, options.signal);
-        // Captcha can outlive a Clerk JWT; force a fresh token before POST.
-        await this.keepAlive(true);
+        const captchaToken = await this.getCaptcha(engage, options.signal, options);
+        if (this.captchaBrowserClips) {
+          this.invalidateFeedListCache();
+          return this.captchaBrowserClips;
+        }
+        if (this.captchaBrowserError)
+          throw new Error(this.captchaBrowserError);
+        // Captcha tokens are bound to the browser JWT that minted them.
+        // Only renew if that JWT is actually about to expire.
+        if (captchaToken) {
+          const remaining = jwtRemainingMs(this.currentToken);
+          if (remaining !== undefined && remaining < KEEPALIVE_RENEW_SKEW_MS)
+            await this.keepAlive(true);
+        }
         return await this.postGenerate({ ...options, captchaToken });
       } catch (e) {
         // A disconnected client must not fail the queued backlog: map any
@@ -1373,7 +1519,8 @@ class SunoApi {
       captchaToken: options.captchaToken,
       captchaTokenProvider: this.captchaTokenProvider,
       userTier: extractUserTierFromJwt(this.currentToken),
-      createSessionToken: this.createSessionToken ??= randomUUID()
+      createSessionToken: this.createSessionToken ??= randomUUID(),
+      transactionUuid: this.captchaTransactionUuid
     });
     logger.info(
       'generateSongs payload:\n' +
@@ -1396,7 +1543,12 @@ class SunoApi {
       `${SunoApi.BASE_URL}/api/generate/v2-web/`,
       payload,
       {
-        timeout: 10000 // 10 seconds timeout
+        timeout: 10000, // 10 seconds timeout
+        headers: options.captchaToken ? {
+          'x-suno-client': 'suno-web',
+          Origin: 'https://suno.com',
+          Referer: 'https://suno.com/create'
+        } : undefined
       }
     );
     if (response.status !== 200) {

@@ -96,8 +96,10 @@ export async function GET(
       });
     }
 
-    // Not captured yet: join (or start) the background harvest and report status.
-    api.beginPreviewHarvest(clipId);
+    // Not captured yet: report status only. Probing must NOT start the
+    // harvest — a capture is only triggered by an actual listen request
+    // (?stream=1 from the preview deck). A harvest started elsewhere
+    // (e.g. a running stream) is still reported live here.
     const status = api.previewJobStatus(clipId);
     if (status?.state === 'error') {
       return NextResponse.json(
@@ -106,7 +108,7 @@ export async function GET(
       );
     }
     return NextResponse.json(
-      { id: clipId, ...status, retry_after: 5 },
+      { id: clipId, state: 'idle', ...status, retry_after: 5 },
       { status: 202, headers: { ...corsHeaders, 'Retry-After': '5' } }
     );
   } catch (error: any) {

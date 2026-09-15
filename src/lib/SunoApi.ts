@@ -35,8 +35,10 @@ const PREVIEW_ERROR_TTL_MS = 30 * 1000;
 // 'complete' clips are written to the on-disk cache; 'streaming' clips live
 // here for this TTL instead.
 const PREVIEW_RESULT_TTL_MS = 10 * 60 * 1000;
-// Fire a background preview harvest right after generation when the audio_url is not directly usable.
-const PREVIEW_PREHARVEST_ENABLED = yn(process.env.SUNO_PREVIEW_PREHARVEST) ?? true;
+/** Reuse a Clerk JWT until this close to expiry instead of POSTing tokens every call. */
+const KEEPALIVE_RENEW_SKEW_MS = 15 * 1000;
+/** Feed listing (`get()` without ids) is polled by the preview deck; short TTL coalesces it. */
+const FEED_LIST_TTL_MS = 10 * 1000;
 
 export type PreviewJobPhase = 'waiting_clip' | 'queued' | 'capturing' | 'error';
 
@@ -259,18 +261,29 @@ export interface GeneratePayloadContext {
  * Extracts the plan id (user_tier) from a Clerk session JWT's `plan` claim.
  * Returns undefined when the token is missing or undecodable.
  */
-export function extractUserTierFromJwt(token?: string): string | undefined {
+function decodeJwtPayload(token?: string): Record<string, unknown> | undefined {
   if (!token) return undefined;
   try {
     const parts = token.split('.');
     if (parts.length < 2) return undefined;
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-    const plan = payload?.plan;
-    if (typeof plan !== 'string' || plan.length === 0) return undefined;
-    return plan.split(':')[0];
+    return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
   } catch {
     return undefined;
   }
+}
+
+export function extractUserTierFromJwt(token?: string): string | undefined {
+  const payload = decodeJwtPayload(token);
+  const plan = payload?.plan;
+  if (typeof plan !== 'string' || plan.length === 0) return undefined;
+  return plan.split(':')[0];
+}
+
+/** Remaining JWT lifetime in ms; undefined if `exp` is missing. */
+function jwtRemainingMs(token?: string): number | undefined {
+  const exp = decodeJwtPayload(token)?.exp;
+  if (typeof exp !== 'number') return undefined;
+  return exp * 1000 - Date.now();
 }
 
 /**
@@ -398,6 +411,19 @@ class SunoApi {
   private captchaGate = new CaptchaGate();
   private ghostCursorEnabled = yn(process.env.BROWSER_GHOST_CURSOR, { default: false });
   private cursor?: Cursor;
+  private feedListCache?: { key: string; at: number; data: AudioInfo[] };
+  private feedListEpoch = 0;
+  private feedInflight = new Map<string, Promise<AudioInfo[]>>();
+
+  /** Drop cached feed pages so the next list poll hits Suno after a create. */
+  private invalidateFeedListCache() {
+    this.feedListCache = undefined;
+    this.feedListEpoch++;
+    for (const key of [...this.feedInflight.keys()]) {
+      // list keys are `${page}\0` with empty ids
+      if (key.endsWith('\0')) this.feedInflight.delete(key);
+    }
+  }
 
   constructor(cookies: string) {
     this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
@@ -487,9 +513,21 @@ class SunoApi {
    * Keep the session alive.
    * @param isWait Indicates if the method should wait for the session to be fully renewed before returning.
    */
-  public async keepAlive(isWait?: boolean): Promise<void> {
+  /**
+   * @param isWait Sleep after renew (legacy generate wait_audio pacing).
+   * @param reuseIfFresh When true, skip the Clerk POST if the current JWT
+   *   still has more than KEEPALIVE_RENEW_SKEW_MS left. Only the feed-list
+   *   poller should pass this; generate/captcha must always renew.
+   */
+  public async keepAlive(isWait?: boolean, reuseIfFresh?: boolean): Promise<void> {
     if (!this.sid) {
       throw new Error('Session ID is not set. Cannot renew token.');
+    }
+    if (reuseIfFresh) {
+      const remaining = jwtRemainingMs(this.currentToken);
+      if (remaining !== undefined && remaining > KEEPALIVE_RENEW_SKEW_MS) {
+        return;
+      }
     }
     // URL to renew session token
     const renewUrl = `${SunoApi.CLERK_BASE_URL}/v1/client/sessions/${this.sid}/tokens?__clerk_api_version=2025-11-10&_clerk_js_version=${SunoApi.CLERK_VERSION}`;
@@ -1216,13 +1254,7 @@ class SunoApi {
     if (response.status !== 200) {
       throw new Error('Error response:' + response.statusText);
     }
-    if (PREVIEW_PREHARVEST_ENABLED && response.data) {
-      const produced = Array.isArray(response.data) ? response.data : [response.data];
-      for (const clip of produced) {
-        if (clip?.id && isUnusableAudioUrl(clip.audio_url))
-          this.beginPreviewHarvest(String(clip.id));
-      }
-    }
+    this.invalidateFeedListCache();
     return response.data;
   }
 
@@ -1282,6 +1314,8 @@ class SunoApi {
       try {
         await this.keepAlive();
         const captchaToken = await this.getCaptcha(engage, options.signal);
+        // Captcha can outlive a Clerk JWT; force a fresh token before POST.
+        await this.keepAlive(true);
         return await this.postGenerate({ ...options, captchaToken });
       } catch (e) {
         // A disconnected client must not fail the queued backlog: map any
@@ -1293,14 +1327,6 @@ class SunoApi {
     }, options.signal);
     const waitAudio = options.wait_audio ?? false;
     const songIds = clips.map((audio: any) => audio.id);
-    if (PREVIEW_PREHARVEST_ENABLED) {
-      // Start the preview harvest right away (no unlock / no download credit) so
-      // later API/MCP requests join an already-running job instead of waiting.
-      for (const clip of clips) {
-        if (clip?.id && isUnusableAudioUrl(clip.audio_url))
-          this.beginPreviewHarvest(String(clip.id));
-      }
-    }
     //Want to wait for music file generation
     if (waitAudio) {
       const startTime = Date.now();
@@ -1376,6 +1402,7 @@ class SunoApi {
     if (response.status !== 200) {
       throw new Error('Error response:' + response.statusText);
     }
+    this.invalidateFeedListCache();
     return response.data.clips;
   }
 
@@ -1457,6 +1484,7 @@ class SunoApi {
     );
 
     console.log('generateStems response:\n', response?.data);
+    this.invalidateFeedListCache();
     return response.data.clips.map((clip: any) => ({
       id: clip.id,
       status: clip.status,
@@ -1565,41 +1593,62 @@ class SunoApi {
     songIds?: string[],
     page?: string | null
   ): Promise<AudioInfo[]> {
-    await this.keepAlive(false);
-    let url = new URL(`${SunoApi.BASE_URL}/api/feed/v2`);
-    if (songIds) {
-      url.searchParams.append('ids', songIds.join(','));
+    const key = `${page ?? ''}\0${(songIds ?? []).join(',')}`;
+    const listMode = !songIds?.length;
+    const epoch = this.feedListEpoch;
+    if (listMode) {
+      const hit = this.feedListCache;
+      if (hit && hit.key === key && Date.now() - hit.at < FEED_LIST_TTL_MS) {
+        return hit.data;
+      }
     }
-    if (page) {
-      url.searchParams.append('page', page);
-    }
-    logger.info('Get audio status: ' + url.href);
-    const response = await this.client.get(url.href, {
-      // 10 seconds timeout
-      timeout: 10000
+    const pending = this.feedInflight.get(key);
+    if (pending) return pending;
+
+    const fetchFeed = async (): Promise<AudioInfo[]> => {
+      await this.keepAlive(false, listMode);
+      const url = new URL(`${SunoApi.BASE_URL}/api/feed/v2`);
+      if (songIds) {
+        url.searchParams.append('ids', songIds.join(','));
+      }
+      if (page) {
+        url.searchParams.append('page', page);
+      }
+      logger.info('Get audio status: ' + url.href);
+      const response = await this.client.get(url.href, {
+        timeout: 10000
+      });
+      const audios = response.data.clips;
+      return audios.map((audio: any) => ({
+        id: audio.id,
+        title: audio.title,
+        image_url: audio.image_url,
+        lyric: audio.metadata.prompt
+          ? this.parseLyrics(audio.metadata.prompt)
+          : '',
+        audio_url: audio.audio_url,
+        video_url: audio.video_url,
+        created_at: audio.created_at,
+        model_name: audio.model_name,
+        status: audio.status,
+        gpt_description_prompt: audio.metadata.gpt_description_prompt,
+        prompt: audio.metadata.prompt,
+        type: audio.metadata.type,
+        tags: audio.metadata.tags,
+        duration: audio.metadata.duration,
+        error_message: audio.metadata.error_message
+      }));
+    };
+
+    const promise = fetchFeed().finally(() => {
+      if (this.feedInflight.get(key) === promise) this.feedInflight.delete(key);
     });
-
-    const audios = response.data.clips;
-
-    return audios.map((audio: any) => ({
-      id: audio.id,
-      title: audio.title,
-      image_url: audio.image_url,
-      lyric: audio.metadata.prompt
-        ? this.parseLyrics(audio.metadata.prompt)
-        : '',
-      audio_url: audio.audio_url,
-      video_url: audio.video_url,
-      created_at: audio.created_at,
-      model_name: audio.model_name,
-      status: audio.status,
-      gpt_description_prompt: audio.metadata.gpt_description_prompt,
-      prompt: audio.metadata.prompt,
-      type: audio.metadata.type,
-      tags: audio.metadata.tags,
-      duration: audio.metadata.duration,
-      error_message: audio.metadata.error_message
-    }));
+    this.feedInflight.set(key, promise);
+    const data = await promise;
+    if (listMode && epoch === this.feedListEpoch) {
+      this.feedListCache = { key, at: Date.now(), data };
+    }
+    return data;
   }
 
   /**
@@ -1650,22 +1699,6 @@ class SunoApi {
       if (harvestLocks.get(clipId) === pending)
         harvestLocks.delete(clipId);
     }
-  }
-
-  /**
-   * Capture the in-player preview (no Premier unlock / no download credit).
-   * Hooks MSE appendBuffer while the Studio page plays the clip.
-   * Backwards-compatible blocking join: cached → buffer, otherwise waits for
-   * the (possibly already running) harvest job to finish.
-   */
-  public async getPreviewAudio(clipId: string): Promise<{ buffer: Buffer; contentType: string }> {
-    const cached = await this.readPreviewCache(clipId);
-    if (cached) return cached;
-    const live = this.readPreviewResult(clipId);
-    if (live) return live;
-    const job = this.beginPreviewHarvest(clipId);
-    const buffer = await job.promise;
-    return { buffer, contentType: this.sniffAudioType(buffer) };
   }
 
   /** Return the cached preview file, or null when not captured yet. */

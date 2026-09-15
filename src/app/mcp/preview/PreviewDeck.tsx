@@ -1,6 +1,7 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
+import { useMseAudio } from './useMseAudio';
 
 /**
  * Preview 试听台（协议层消费者）：
@@ -10,9 +11,15 @@ import { useCallback, useEffect, useRef, useState } from 'react';
  *     ready     → 已缓存完整（立即完整回放）
  *     pending   → 待捕获（点击后才开始捕获并渐进试听）
  * - 试听一律走 /api/preview/{id}?stream=1（chunked 渐进流），三种状态同一入口
+ * - 播放器为自绘控件：串流是线性直播流（Accept-Ranges: none），浏览器读不到
+ *   duration、原生 <audio controls> 不显示进度且不可定位；这里改用已知音轨时长
+ *   绘制进度/缓冲条。串流经 MSE（useMseAudio）接管：chunk 追加进 SourceBuffer
+ *   后，已捕获部分（如捕获 60% 时其之前）可自由回跳，EOF 后全长可定位；MSE
+ *   不可用/类型不支持时回退直接 src（浏览器视为直播，seek 不生效）。ready 音轨
+ *   走支持 Range 的完整缓存 URL，可完整 seek（回退路径捕获完成后仍热切换升级）
  *
- * 注意：探测 /api/preview/{id} 会为从未捕获过的音轨启动后台浏览器捕获，
- * 因此只对最新的 PROBE_TOP_N 条做自动探测，避免占满全局串行捕获队列。
+ * 注意：探测 /api/preview/{id} 是只读的，不会启动后台捕获——缓冲只在真正
+ * 试听（?stream=1）时触发；因此自动探测只是状态轮询，随时可放开条数上限。
  */
 
 type PreviewState = 'generating' | 'pending' | 'capturing' | 'ready' | 'error';
@@ -31,7 +38,7 @@ interface TrackView {
 
 const POLL_MS = 5000;
 const STATUS_POLL_MS = 3000;
-/** 自动探测（可能触发捕获）的最新音轨条数上限 */
+/** 自动状态探测（只读，不触发捕获）的最新音轨条数上限 */
 const PROBE_TOP_N = 3;
 
 const PREVIEW_LABEL: Record<PreviewState, string> = {
@@ -147,13 +154,22 @@ export default function PreviewDeck() {
   const [playing, setPlaying] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [posSec, setPosSec] = useState(0);
+  const [bufferedSec, setBufferedSec] = useState(0);
+  const [mediaDurationSec, setMediaDurationSec] = useState(0);
+  const [volume, setVolume] = useState(1);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const playerAnchorRef = useRef<HTMLDivElement | null>(null);
-  const [playerDocked, setPlayerDocked] = useState(false);
+  const barRef = useRef<HTMLDivElement | null>(null);
   const currentIdRef = useRef<string | null>(null);
   currentIdRef.current = currentId;
   const tracksRef = useRef<TrackView[]>([]);
   tracksRef.current = tracks;
+
+  const currentTrack = tracks.find((t) => t.id === currentId) ?? null;
+  // 串流是线性直播流，浏览器读不到 duration；优先用曲目元数据里的已知时长
+  const durationSec = currentTrack ? currentTrack.durationSec || mediaDurationSec : 0;
+  const playedPct = durationSec > 0 ? Math.min(100, (posSec / durationSec) * 100) : 0;
+  const bufferedPct = durationSec > 0 ? Math.min(100, (bufferedSec / durationSec) * 100) : 0;
 
   const refresh = useCallback(async () => {
     try {
@@ -175,9 +191,9 @@ export default function PreviewDeck() {
       });
       setLastRefresh(new Date());
 
-      // 仅对最新且可 preview 的几条做自动探测（探测会触发后台捕获，见文件头注释）。
-      // error 轨道排除：服务端 errored job 30s 后删除，再探测会重启完整浏览器
-      // 捕获，持久失败的 clip 不应被自动探测无限重试（点击播放仍是手动重试入口）。
+      // 仅对最新且可 preview 的几条做自动状态探测（只读，不会触发捕获）。
+      // error 轨道排除：服务端对 errored job 只保留 30s 即删除，之后探测只会
+      // 再拿到 502，对持久失败的 clip 自动轮询没有意义（点击播放仍是手动重试入口）。
       const knownById = new Map(tracksRef.current.map((t) => [t.id, t]));
       const probeable = fresh.filter((t) => t.status === 'complete' || t.status === 'streaming');
       const targets = new Set(
@@ -199,53 +215,159 @@ export default function PreviewDeck() {
   }, []);
 
   useEffect(() => {
-    refresh();
-    const timer = setInterval(refresh, POLL_MS);
-    return () => clearInterval(timer);
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (timer) return;
+      refresh();
+      timer = setInterval(refresh, POLL_MS);
+    };
+    const stop = () => {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    };
+    const onVisibility = () => {
+      if (document.hidden) stop();
+      else start();
+    };
+    onVisibility();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      stop();
+    };
   }, [refresh]);
 
-  // 播放器滚出视口时浮动到底部（保持同一 <audio> 元素，避免重载）
-  useEffect(() => {
-    const el = playerAnchorRef.current;
-    if (!el) return;
-    const observer = new IntersectionObserver(
-      ([entry]) => setPlayerDocked(!entry.isIntersecting),
-      { threshold: 0 }
-    );
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-
-  // 播放中音轨的捕获进度细粒度轮询
+  // 播放中音轨的捕获进度细粒度轮询（本机 preview 状态，不打 Suno）
   useEffect(() => {
     if (!currentId) return;
-    const timer = setInterval(async () => {
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const tick = async () => {
       const probe = await probePreview(currentId);
       setTracks((prev) => prev.map((t) => (t.id === currentId ? applyProbe(t, probe) : t)));
-    }, STATUS_POLL_MS);
-    return () => clearInterval(timer);
+    };
+    const start = () => {
+      if (timer) return;
+      tick();
+      timer = setInterval(tick, STATUS_POLL_MS);
+    };
+    const stop = () => {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    };
+    const onVisibility = () => {
+      if (document.hidden) stop();
+      else start();
+    };
+    onVisibility();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      stop();
+    };
   }, [currentId]);
+
+  // 自绘进度条数据源：原生控件对线性直播流不显示时长/进度
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const syncPosition = () => {
+      setPosSec(audio.currentTime || 0);
+      setBufferedSec(audio.buffered.length ? audio.buffered.end(audio.buffered.length - 1) : 0);
+      setMediaDurationSec(Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0);
+    };
+    const onPlay = () => setPlaying(true);
+    const onPause = () => setPlaying(false);
+    audio.addEventListener('timeupdate', syncPosition);
+    audio.addEventListener('durationchange', syncPosition);
+    audio.addEventListener('progress', syncPosition);
+    audio.addEventListener('loadedmetadata', syncPosition);
+    audio.addEventListener('play', onPlay);
+    audio.addEventListener('pause', onPause);
+    return () => {
+      audio.removeEventListener('timeupdate', syncPosition);
+      audio.removeEventListener('durationchange', syncPosition);
+      audio.removeEventListener('progress', syncPosition);
+      audio.removeEventListener('loadedmetadata', syncPosition);
+      audio.removeEventListener('play', onPlay);
+      audio.removeEventListener('pause', onPause);
+    };
+  }, []);
+
+  // 正在串流试听的音轨捕获完成后，热切换到支持 Range 的完整缓存 URL：
+  // 从线性直播升级成可完整 seek 的回放（保留播放位置与播放状态）。
+  // 新 URL 加载失败时由 handleAudioError 复位播放态；不回退旧流（旧流已废弃）。
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio || !currentId) return;
+    const track = tracks.find((t) => t.id === currentId);
+    if (!track || track.preview !== 'ready') return;
+    const src = audio.getAttribute('src');
+    if (!src || !src.includes('stream=1')) return;
+    const nextUrl = `/api/preview/${track.id}`;
+    // 已听到结尾时从头回放（升级后可自由定位）；否则保留播放位置
+    const pos = audio.ended ? 0 : audio.currentTime;
+    const resume = !audio.paused && !audio.ended;
+    const onMeta = () => {
+      audio.removeEventListener('loadedmetadata', onMeta);
+      // src 已被后续操作（切曲/停止/再次热切换）替换时，不施加旧位置
+      if (audio.getAttribute('src') !== nextUrl) return;
+      try {
+        audio.currentTime = pos;
+      } catch {
+        // 元数据未就绪等极端情况：放弃位置恢复，从头播放
+      }
+      if (resume) audio.play().catch(() => setPlaying(false));
+    };
+    audio.addEventListener('loadedmetadata', onMeta);
+    audio.src = nextUrl;
+    audio.load();
+    // 依赖重触发/卸载时，仅当 src 已被切走（切曲/停止）才移除监听器；
+    // 升级在途（src 仍指向 nextUrl）时保留，避免 loadedmetadata 晚于轮询
+    // 触发的重跑到达，导致位置恢复/续播被静默丢弃。onMeta 触发时自移除。
+    return () => {
+      if (audio.getAttribute('src') !== nextUrl) audio.removeEventListener('loadedmetadata', onMeta);
+    };
+  }, [tracks, currentId]);
+
+  const { start: startMse, stop: stopMse } = useMseAudio(audioRef);
 
   const play = useCallback((track: TrackView) => {
     const audio = audioRef.current;
     if (!audio) return;
     setCurrentId(track.id);
     setNotice(null);
-    // ready：完整缓存，普通 URL 支持 Range seek；其余：渐进流（线性直播式播放）
-    audio.src =
-      track.preview === 'ready'
-        ? `/api/preview/${track.id}`
-        : `/api/preview/${track.id}?stream=1`;
+    // 切轨时清零进度显示，避免新曲 loadedmetadata 前残留上一曲位置
+    setPosSec(0);
+    setBufferedSec(0);
+    setMediaDurationSec(0);
+    // ready：完整缓存，普通 URL 支持 Range seek；其余：MSE 接管渐进流
+    // （SourceBuffer 的 seekable=已缓冲区间，已捕获部分可回跳；失败时
+    // start 内部回退为直接 src，行为等同旧线性直播播放）
+    if (track.preview === 'ready') {
+      stopMse();
+      audio.src = `/api/preview/${track.id}`;
+    } else {
+      startMse(`/api/preview/${track.id}?stream=1`);
+    }
+    const srcAtPlay = audio.getAttribute('src');
     audio
       .play()
       .then(() => setPlaying(true))
       .catch(() => {
+        // src 被后续操作替换（MSE 回退/热切换/停止）会使 pending 的 play
+        // promise 以 AbortError 拒绝，非真实播放失败，不提示
+        if (audio.getAttribute('src') !== srcAtPlay) return;
         setPlaying(false);
         setNotice(`《${track.title}》播放失败：捕获可能尚未开始或已失败，稍后重试`);
       });
-  }, []);
+  }, [startMse, stopMse]);
 
   const stop = useCallback(() => {
+    stopMse();
     const audio = audioRef.current;
     if (audio) {
       audio.pause();
@@ -254,17 +376,61 @@ export default function PreviewDeck() {
     }
     setCurrentId(null);
     setPlaying(false);
-  }, []);
+    setPosSec(0);
+    setBufferedSec(0);
+    setMediaDurationSec(0);
+  }, [stopMse]);
+
+  const togglePlay = () => {
+    const audio = audioRef.current;
+    if (!audio || !currentTrack) return;
+    if (audio.paused) {
+      audio.play().catch(() => {
+        setPlaying(false);
+        setNotice(`《${currentTrack.title}》播放失败：捕获可能尚未开始或已失败，稍后重试`);
+      });
+    } else {
+      audio.pause();
+    }
+  };
+
+  const seekTo = (sec: number) => {
+    const audio = audioRef.current;
+    if (!audio || !currentTrack || !Number.isFinite(sec)) return;
+    const target = durationSec > 0 ? Math.min(Math.max(sec, 0), durationSec) : Math.max(sec, 0);
+    // 串流为线性直播（Accept-Ranges: none）：只能回跳到已缓冲区间；完整定位需等捕获完成
+    if (currentTrack.preview !== 'ready') {
+      const end = audio.buffered.length ? audio.buffered.end(audio.buffered.length - 1) : 0;
+      if (target > end + 0.3) {
+        setNotice('串流为线性直播：仅可回跳到已缓冲部分，前进定位需等捕获完成');
+        return;
+      }
+    }
+    audio.currentTime = target;
+    setPosSec(target);
+  };
+
+  const onBarClick = (e: MouseEvent<HTMLDivElement>) => {
+    const el = barRef.current;
+    if (!el || !currentTrack || durationSec <= 0) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    seekTo(ratio * durationSec);
+  };
 
   // 媒体错误（如流在首个 chunk 前 502）：复位播放态并提示。
   // 以 src 是否仍存在区分正常路径（stop() 清源）与真实错误。
   const handleAudioError = useCallback(() => {
     const audio = audioRef.current;
     if (!audio?.getAttribute('src')) return;
+    // 先停 MSE 会话：否则随后的回退/重试可能为一个 UI 已标失败的音轨
+    // 重启服务端捕获
+    stopMse();
     setPlaying(false);
     setCurrentId(null);
     setNotice('播放失败：preview 流不可用（捕获失败或已被取消），可稍后重新点击');
-  }, []);
+  }, [stopMse]);
 
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100 p-6">
@@ -331,27 +497,55 @@ export default function PreviewDeck() {
           )}
         </ul>
 
-        {/* 原位锚点：滚过它之后播放器浮动到底部 */}
-        <div ref={playerAnchorRef} className="mt-6 h-px" aria-hidden="true" />
-        <div
-          className={
-            playerDocked
-              ? 'fixed bottom-0 left-0 right-0 z-50 border-t border-zinc-800 bg-zinc-950/95 p-3 backdrop-blur'
-              : 'mt-4'
-          }
-        >
-          {playerDocked && (
-            <div className="mb-1 truncate text-xs text-zinc-400">
-              {currentId ? `正在试听：${tracks.find((t) => t.id === currentId)?.title ?? currentId}` : '试听台'}
+        {/* sticky：只改定位，宽高与原位一致，子树不因浮动增删（reuse 同一控件） */}
+        <div className="sticky bottom-0 z-50 mt-6 w-full bg-zinc-950">
+          <audio ref={audioRef} onEnded={() => setPlaying(false)} onError={handleAudioError} preload="metadata" />
+          <div className="mt-1 flex items-center gap-3">
+            <button
+              type="button"
+              onClick={togglePlay}
+              disabled={!currentTrack}
+              className="shrink-0 rounded-full border border-zinc-700 px-3 py-1 text-sm text-zinc-200 transition-colors hover:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {playing ? '⏸ 暂停' : '▶ 播放'}
+            </button>
+            <div
+              ref={barRef}
+              role="slider"
+              aria-label="播放进度"
+              aria-valuemin={0}
+              aria-valuemax={Math.round(durationSec)}
+              aria-valuenow={Math.round(posSec)}
+              onClick={onBarClick}
+              className={`relative h-2 flex-1 overflow-hidden rounded-full bg-zinc-800 ${
+                currentTrack && durationSec > 0 ? 'cursor-pointer' : 'opacity-60'
+              }`}
+            >
+              <div className="absolute inset-y-0 left-0 bg-zinc-600" style={{ width: `${bufferedPct}%` }} />
+              <div className="absolute inset-y-0 left-0 bg-sky-500" style={{ width: `${playedPct}%` }} />
             </div>
-          )}
-          <audio
-            ref={audioRef}
-            className="w-full"
-            controls
-            onEnded={() => setPlaying(false)}
-            onError={handleAudioError}
-          />
+            <span className="w-28 shrink-0 text-right text-xs tabular-nums text-zinc-400">
+              {currentTrack
+                ? durationSec > 0
+                  ? `${fmtTime(posSec)} / ${fmtTime(durationSec)}`
+                  : `${fmtTime(posSec)} / …`
+                : '--:-- / --:--'}
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={volume}
+              aria-label="音量"
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setVolume(v);
+                if (audioRef.current) audioRef.current.volume = v;
+              }}
+              className="w-20 shrink-0 accent-sky-500"
+            />
+          </div>
           {notice && (
             <p className="mt-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-300">
               {notice}

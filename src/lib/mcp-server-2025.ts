@@ -209,7 +209,7 @@ async function runGenerationTool(
           String(args.prompt),
           Boolean(args.make_instrumental),
           args.model ? String(args.model) : DEFAULT_MODEL,
-          Boolean(args.wait_audio),
+          false,
           undefined,
           extrasFromArgs(args)
         );
@@ -221,7 +221,7 @@ async function runGenerationTool(
           String(args.title),
           Boolean(args.make_instrumental),
           args.model ? String(args.model) : DEFAULT_MODEL,
-          Boolean(args.wait_audio),
+          false,
           args.negative_tags ? String(args.negative_tags) : undefined,
           undefined,
           extrasFromArgs(args)
@@ -236,7 +236,7 @@ async function runGenerationTool(
           args.negative_tags ? String(args.negative_tags) : "",
           args.title ? String(args.title) : "",
           args.model ? String(args.model) : undefined,
-          Boolean(args.wait_audio)
+          false
         );
         break;
       case "generate_sound":
@@ -252,7 +252,9 @@ async function runGenerationTool(
       default:
         return buildToolError(`Unknown generation tool: ${toolName}`);
     }
-    const embedAudio = toolName === "generate_sound" ? args.wait_audio !== false : Boolean(args.wait_audio);
+    // Only generate_sound still supports the wait_audio/embed mode (default on);
+    // song tools always return immediately and never embed preview audio.
+    const embedAudio = toolName === "generate_sound" && args.wait_audio !== false;
     return buildToolResult(result, { api, embedAudio });
   } catch (err: any) {
     return buildToolError(err.message || String(err));
@@ -341,7 +343,6 @@ const GENERATE_MUSIC_SCHEMA = {
   ),
   make_instrumental: z.boolean().optional().describe("Whether the generated audio should be instrumental only"),
   model: z.string().optional().describe(MODEL_DESCRIPTION),
-  wait_audio: z.boolean().optional().describe("If true, blocks until audio generation is complete (up to ~100s). Default: false (returns immediately; poll get_audio_info for results)"),
   ...EXTRAS_SCHEMA_FIELDS,
 };
 
@@ -355,7 +356,6 @@ const GENERATE_CUSTOM_MUSIC_SCHEMA = {
   title: z.string().describe("Title of the song"),
   make_instrumental: z.boolean().optional().describe("Whether the generated audio should be instrumental only"),
   model: z.string().optional().describe(MODEL_DESCRIPTION),
-  wait_audio: z.boolean().optional().describe("If true, blocks until audio generation is complete (up to ~100s). Default: false (returns immediately; poll get_audio_info for results)"),
   negative_tags: z.string().optional().describe("Tags to exclude from generation"),
   ...EXTRAS_SCHEMA_FIELDS,
 };
@@ -368,7 +368,6 @@ const EXTEND_AUDIO_SCHEMA = {
   negative_tags: z.string().optional().describe("Tags to exclude"),
   title: z.string().optional().describe("Title of the song"),
   model: z.string().optional().describe("Model name (default: chirp-hawk)"),
-  wait_audio: z.boolean().optional().describe("If true, blocks until generation is complete (up to ~100s). Default: false (returns immediately; poll get_audio_info for results)"),
 };
 
 const GENERATE_SOUND_SCHEMA = {
@@ -427,11 +426,11 @@ export function createMcpServer(): McpServer {
         String(args.prompt),
         Boolean(args.make_instrumental),
         args.model ? String(args.model) : DEFAULT_MODEL,
-        Boolean(args.wait_audio),
+        false,
         extra.signal,
         extrasFromArgs(args)
       );
-      return buildToolResult(result, { api, embedAudio: Boolean(args.wait_audio) });
+      return buildToolResult(result, { api });
     }
   );
 
@@ -456,12 +455,12 @@ export function createMcpServer(): McpServer {
         String(args.title),
         Boolean(args.make_instrumental),
         args.model ? String(args.model) : DEFAULT_MODEL,
-        Boolean(args.wait_audio),
+        false,
         args.negative_tags ? String(args.negative_tags) : undefined,
         extra.signal,
         extrasFromArgs(args)
       );
-      return buildToolResult(result, { api, embedAudio: Boolean(args.wait_audio) });
+      return buildToolResult(result, { api });
     }
   );
 
@@ -487,10 +486,10 @@ export function createMcpServer(): McpServer {
         args.negative_tags ? String(args.negative_tags) : "",
         args.title ? String(args.title) : "",
         args.model ? String(args.model) : undefined,
-        Boolean(args.wait_audio),
+        false,
         extra.signal
       );
-      return buildToolResult(result, { api, embedAudio: Boolean(args.wait_audio) });
+      return buildToolResult(result, { api });
     }
   );
 

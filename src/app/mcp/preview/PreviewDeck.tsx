@@ -6,7 +6,8 @@ import { useMseAudio } from './useMseAudio';
 /**
  * Preview 试听台（协议层消费者）：
  * - 轮询 /api/get 第一时间发现新的可 preview 音轨（status = complete | streaming）
- * - 对最新几条音轨探测 /api/preview/{id}，区分三态：
+ * - clip 一旦 complete/streaming，立即标 pending 并可点（不依赖探测）
+ * - 对可 preview 音轨探测 /api/preview/{id}，细化三态：
  *     capturing → 正在串流的 preview（可渐进试听）
  *     ready     → 已缓存完整（立即完整回放）
  *     pending   → 待捕获（点击后才开始捕获并渐进试听）
@@ -19,7 +20,8 @@ import { useMseAudio } from './useMseAudio';
  *   走支持 Range 的完整缓存 URL，可完整 seek（回退路径捕获完成后仍热切换升级）
  *
  * 注意：探测 /api/preview/{id} 是只读的，不会启动后台捕获——缓冲只在真正
- * 试听（?stream=1）时触发；因此自动探测只是状态轮询，随时可放开条数上限。
+ * 试听（?stream=1）时触发。探测只细化 pending/capturing/ready/error 徽章，
+ * 不得把未探测到的 complete 音轨当成「生成中」禁用点击。
  */
 
 type PreviewState = 'generating' | 'pending' | 'capturing' | 'ready' | 'error';
@@ -38,7 +40,8 @@ interface TrackView {
 
 const POLL_MS = 5000;
 const STATUS_POLL_MS = 3000;
-/** 自动状态探测（只读，不触发捕获）的最新音轨条数上限 */
+/** 自动探测条数上限。探测已缓存音轨会收到 200 二进制体再 cancel，不能对整页狂打。
+ *  未探测到的 complete 音轨仍是 pending、可点，不依赖这个上限。 */
 const PROBE_TOP_N = 3;
 
 const PREVIEW_LABEL: Record<PreviewState, string> = {
@@ -49,21 +52,39 @@ const PREVIEW_LABEL: Record<PreviewState, string> = {
   error: '捕获失败'
 };
 
+function isPreviewableStatus(status: string): boolean {
+  return status === 'complete' || status === 'streaming';
+}
+
+function previewFromClipStatus(status: string): PreviewState {
+  return isPreviewableStatus(status) ? 'pending' : 'generating';
+}
+
+/** Keep probe-refined badges; never leave a complete clip stuck as generating. */
+function retainPreview(old: TrackView, status: string): PreviewState {
+  if (!isPreviewableStatus(status)) return 'generating';
+  if (old.preview === 'generating') return 'pending';
+  return old.preview;
+}
+
 async function fetchRecentTracks(): Promise<TrackView[]> {
   const res = await fetch('/api/get?page=1', { cache: 'no-store' });
   if (!res.ok) return [];
   const data: any[] = await res.json().catch(() => []);
-  return data.map((c: any) => ({
-    id: String(c.id),
-    title: c.title || String(c.id),
-    status: String(c.status || ''),
-    createdAt: c.created_at ? String(c.created_at) : undefined,
-    preview: 'generating' as PreviewState,
-    progressPercent: null,
-    currentSec: 0,
-    durationSec: Number(c.duration) || 0,
-    error: null
-  }));
+  return data.map((c: any) => {
+    const status = String(c.status || '');
+    return {
+      id: String(c.id),
+      title: c.title || String(c.id),
+      status,
+      createdAt: c.created_at ? String(c.created_at) : undefined,
+      preview: previewFromClipStatus(status),
+      progressPercent: null,
+      currentSec: 0,
+      durationSec: Number(c.duration) || 0,
+      error: null
+    };
+  });
 }
 
 type ProbeResult =
@@ -179,23 +200,25 @@ export default function PreviewDeck() {
         return fresh.map((t) => {
           const old = prevById.get(t.id);
           if (!old) return t;
-          // 保留已有 preview 状态，仅刷新曲目元数据；error 状态允许重探测覆盖
+          // 刷新曲目元数据；Suno 侧完成后从 generating 升为 pending。
+          // capturing/ready/pending/error 由探测覆盖，这里只避免 stale generating。
           return {
             ...old,
             title: t.title,
             status: t.status,
             createdAt: t.createdAt ?? old.createdAt,
-            durationSec: t.durationSec || old.durationSec
+            durationSec: t.durationSec || old.durationSec,
+            preview: retainPreview(old, t.status)
           };
         });
       });
       setLastRefresh(new Date());
 
-      // 仅对最新且可 preview 的几条做自动状态探测（只读，不会触发捕获）。
+      // 只读探测最新几条，细化 pending/capturing/ready 徽章（不会触发捕获）。
       // error 轨道排除：服务端对 errored job 只保留 30s 即删除，之后探测只会
       // 再拿到 502，对持久失败的 clip 自动轮询没有意义（点击播放仍是手动重试入口）。
       const knownById = new Map(tracksRef.current.map((t) => [t.id, t]));
-      const probeable = fresh.filter((t) => t.status === 'complete' || t.status === 'streaming');
+      const probeable = fresh.filter((t) => isPreviewableStatus(t.status));
       const targets = new Set(
         probeable
           .slice(0, PROBE_TOP_N)
@@ -450,8 +473,9 @@ export default function PreviewDeck() {
         <ul className="space-y-2">
           {tracks.map((t) => {
             const active = t.id === currentId;
-            // error 也保留点击入口：点击即重试（服务端会清掉残留 error job 并重启捕获）
+            // complete/streaming 即可点（pending）；error 点击即重试捕获
             const clickable =
+              isPreviewableStatus(t.status) ||
               t.preview === 'capturing' ||
               t.preview === 'ready' ||
               t.preview === 'pending' ||

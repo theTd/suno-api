@@ -334,33 +334,41 @@ const EXTRAS_SCHEMA_FIELDS = {
 } as const;
 
 const GENERATE_MUSIC_SCHEMA = {
-  prompt: z.string().describe("Text description of the music to generate"),
+  prompt: z.string().describe(
+    "Style + theme description of the music (e.g. 'melancholic piano ballad about autumn'). " +
+    "This is NOT where lyrics go — Suno auto-writes lyrics from this description. " +
+    "If you have specific lyrics, use generate_custom_music instead."
+  ),
   make_instrumental: z.boolean().optional().describe("Whether the generated audio should be instrumental only"),
   model: z.string().optional().describe(MODEL_DESCRIPTION),
-  wait_audio: z.boolean().optional().describe("If true, blocks until audio generation is complete (up to ~100s)"),
+  wait_audio: z.boolean().optional().describe("If true, blocks until audio generation is complete (up to ~100s). Default: false (returns immediately; poll get_audio_info for results)"),
   ...EXTRAS_SCHEMA_FIELDS,
 };
 
 const GENERATE_CUSTOM_MUSIC_SCHEMA = {
-  prompt: z.string().describe("Lyrics or description for the music"),
-  tags: z.string().describe("Style tags / genre (e.g., 'pop, upbeat')"),
+  prompt: z.string().describe(
+    "The full song LYRICS (with [Verse]/[Chorus] structure if desired). " +
+    "Style/genre does NOT go here — put it in `tags`. " +
+    "If you only have a style/theme idea and no lyrics, use generate_music instead."
+  ),
+  tags: z.string().describe("Style tags / genre (e.g., 'pop, upbeat, female vocal')"),
   title: z.string().describe("Title of the song"),
   make_instrumental: z.boolean().optional().describe("Whether the generated audio should be instrumental only"),
   model: z.string().optional().describe(MODEL_DESCRIPTION),
-  wait_audio: z.boolean().optional().describe("If true, blocks until audio generation is complete (up to ~100s)"),
+  wait_audio: z.boolean().optional().describe("If true, blocks until audio generation is complete (up to ~100s). Default: false (returns immediately; poll get_audio_info for results)"),
   negative_tags: z.string().optional().describe("Tags to exclude from generation"),
   ...EXTRAS_SCHEMA_FIELDS,
 };
 
 const EXTEND_AUDIO_SCHEMA = {
   audio_id: z.string().describe("ID of the audio clip to extend"),
-  prompt: z.string().optional().describe("Prompt for the extension"),
+  prompt: z.string().optional().describe("Lyrics/text for the extension content (style goes in `tags`)"),
   continue_at: z.number().optional().describe("Timestamp in seconds to continue from. Default extends from end."),
   tags: z.string().optional().describe("Style tags for the extension"),
   negative_tags: z.string().optional().describe("Tags to exclude"),
   title: z.string().optional().describe("Title of the song"),
   model: z.string().optional().describe("Model name (default: chirp-hawk)"),
-  wait_audio: z.boolean().optional().describe("Wait for generation to complete"),
+  wait_audio: z.boolean().optional().describe("If true, blocks until generation is complete (up to ~100s). Default: false (returns immediately; poll get_audio_info for results)"),
 };
 
 const GENERATE_SOUND_SCHEMA = {
@@ -389,8 +397,9 @@ export function createMcpServer(): McpServer {
       },
       instructions:
         "This server provides tools for Suno AI music generation. " +
-        "Use generate_music for simple prompts, generate_custom_music for full control with lyrics/style/title, " +
-        "generate_sound for sound effects, extend_audio to extend existing clips, " +
+        "Routing: generate_music takes a STYLE/THEME description and auto-writes lyrics — never put full lyrics there. " +
+        "generate_custom_music takes full LYRICS in `prompt`, with style/genre in `tags` and a `title` (all three required). " +
+        "Use generate_sound for sound effects, extend_audio to extend existing clips, " +
         "or the query tools (get_audio_info, get_account_limit) for read-only operations.",
       taskStore,
       taskMessageQueue: new InMemoryTaskMessageQueue(),
@@ -404,7 +413,10 @@ export function createMcpServer(): McpServer {
     {
       title: "Generate Music",
       description:
-        "Generate music from a text prompt using Suno AI. Returns an array of audio clips.",
+        "Generate music from a style/theme text prompt using Suno AI; lyrics are auto-written from the prompt. " +
+        "Do NOT pass full lyrics here — if you have specific lyrics, use generate_custom_music (prompt=lyrics, tags=style, title). " +
+        "Consumes shared-account credits (2 clips per call; check get_account_limit first). " +
+        "Returns an array of audio clips.",
       inputSchema: GENERATE_MUSIC_SCHEMA,
       annotations: GENERATION_ANNOTATIONS,
     },
@@ -429,7 +441,9 @@ export function createMcpServer(): McpServer {
     {
       title: "Generate Custom Music",
       description:
-        "Generate music with full control over lyrics, style tags, and title.",
+        "Generate music with full control: prompt = the full song LYRICS, tags = style/genre, title = song title (all three required). " +
+        "For a style/theme idea without lyrics, use generate_music instead. " +
+        "Consumes shared-account credits (2 clips per call; check get_account_limit first).",
       inputSchema: GENERATE_CUSTOM_MUSIC_SCHEMA,
       annotations: GENERATION_ANNOTATIONS,
     },
@@ -457,7 +471,8 @@ export function createMcpServer(): McpServer {
     {
       title: "Extend Audio",
       description:
-        "Extend an existing audio clip by generating additional content.",
+        "Extend an existing audio clip by generating additional content. " +
+        "prompt = lyrics/text for the continuation (style goes in `tags`). Consumes shared-account credits.",
       inputSchema: EXTEND_AUDIO_SCHEMA,
       annotations: GENERATION_ANNOTATIONS,
     },
@@ -484,7 +499,7 @@ export function createMcpServer(): McpServer {
     "concat_audio",
     {
       title: "Concatenate Audio",
-      description: "Concatenate a clip to generate the full song.",
+      description: "Concatenate a clip to generate the full song. Consumes shared-account credits.",
       inputSchema: {
         clip_id: z.string().describe("ID of the audio clip to concatenate"),
       },
@@ -492,7 +507,7 @@ export function createMcpServer(): McpServer {
         readOnlyHint: false,
         destructiveHint: false,
         openWorldHint: true,
-        idempotentHint: true,
+        idempotentHint: false,
       },
     },
     async (args: any, extra: ToolExtra) => {

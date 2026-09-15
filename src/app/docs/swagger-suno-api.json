@@ -25,7 +25,7 @@
                 "properties": {
                   "prompt": {
                     "type": "string",
-                    "description": "Prompt",
+                    "description": "Style and theme description of the music. NOT lyrics — Suno auto-writes lyrics from this description. To supply your own lyrics, use /api/custom_generate.",
                     "example": "A popular heavy metal song about war, sung by a deep-voiced male singer, slowly and melodiously. The lyrics depict the sorrow of people after the war."
                   },
                   "make_instrumental": {
@@ -110,19 +110,31 @@
     "/v1/chat/completions": {
       "post": {
         "summary": "Generate audio based on Prompt - OpenAI API format compatibility.",
-        "description": "Convert the `/api/generate` API to be compatible with the OpenAI `/v1/chat/completions` API format. \n\nGenerally used in OpenAI compatible clients.",
+        "description": "Convert the `/api/generate` API to be compatible with the OpenAI `/v1/chat/completions` API format. \n\nGenerally used in OpenAI compatible clients.\n\nThe last user message is used as the style/theme description of the music (NOT lyrics — Suno auto-writes lyrics from it; to supply your own lyrics use `/api/custom_generate`). Note: always generates instrumental audio and waits for completion.",
         "tags": ["default"],
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": ["prompt"],
+                "required": ["messages"],
                 "properties": {
-                  "prompt": {
-                    "type": "string",
-                    "description": "Prompt",
-                    "example": "A popular heavy metal song about war, sung by a deep-voiced male singer, slowly and melodiously. The lyrics depict the sorrow of people after the war."
+                  "messages": {
+                    "type": "array",
+                    "description": "OpenAI-format chat messages. The last user message content is the style/theme description of the music (NOT lyrics).",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "role": {
+                          "type": "string",
+                          "example": "user"
+                        },
+                        "content": {
+                          "type": "string",
+                          "example": "A popular heavy metal song about war, sung by a deep-voiced male singer, slowly and melodiously. The lyrics depict the sorrow of people after the war."
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -163,7 +175,7 @@
                 "properties": {
                   "prompt": {
                     "type": "string",
-                    "description": "Detailed prompt, including information such as music lyrics.",
+                    "description": "Lyrics for the song. Put style/genre in `tags`, not here.",
                     "example": "[Verse 1]\nCruel flames of war engulf this land\nBattlefields filled with death and dread\nInnocent souls in darkness, they rest\nMy heart trembles in this silent test\n\n[Verse 2]\nPeople weep for loved ones lost\nBattered bodies bear the cost\nSeeking peace and hope once known\nOur grief transforms to hearts of stone\n\n[Chorus]\nSilent battlegrounds, no birds' song\nShadows of war, where we don't belong\nMay flowers of peace bloom in this place\nLet's guard this precious dream with grace\n\n[Bridge]\nThrough the ashes, we will rise\nHand in hand, towards peaceful skies\nNo more sorrow, no more pain\nTogether, we'll break these chains\n\n[Chorus]\nSilent battlegrounds, no birds' song\nShadows of war, where we don't belong\nMay flowers of peace bloom in this place\nLet's guard this precious dream with grace\n\n[Outro]\nIn unity, our strength will grow\nA brighter future, we'll soon know\nFrom the ruins, hope will spring\nA new dawn, we'll together bring"
                   },
                   "tags": {
@@ -279,13 +291,13 @@
                   },
                   "prompt": {
                     "type": "string",
-                    "description": "Detailed prompt, including information such as music lyrics.",
+                    "description": "Lyrics/text for the extension content. Style goes in `tags`.",
                     "example": "[lrc]Silent battlegrounds, no birds' song\nShadows of war, where we don't belong\nMay flowers of peace bloom in this place\nLet's guard this precious dream with grace\n[endlrc]"
                   },
                   "continue_at": {
-                    "type": "string",
-                    "description": "Extend a new clip from a song at mm:ss(e.g. 00:30). Default extends from the end of the song.",
-                    "example": "109.96"
+                    "type": "number",
+                    "description": "Timestamp in seconds to continue from (e.g. 109.96). Default extends from the end of the song.",
+                    "example": 109.96
                   },
                   "title": {
                     "type": "string",

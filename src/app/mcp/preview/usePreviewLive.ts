@@ -15,12 +15,14 @@ const LOAD_PAGE_TIMEOUT_MS = 15_000;
 
 type PreviewStatusMessage = Extract<PreviewLiveServerMessage, { type: 'preview_status' }>;
 type ClipStatusMessage = Extract<PreviewLiveServerMessage, { type: 'clip_status' }>;
+type UnlockStatusMessage = Extract<PreviewLiveServerMessage, { type: 'unlock_status' }>;
 
 export function usePreviewLive(handlers: {
   onHello: (tracks: PreviewTrack[]) => void;
   onPage1: (tracks: PreviewTrack[]) => void;
   onPreviewStatus: (msg: PreviewStatusMessage) => void;
   onClipStatus: (msg: ClipStatusMessage) => void;
+  onUnlockStatus?: (msg: UnlockStatusMessage) => void;
 }) {
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
@@ -88,6 +90,7 @@ export function usePreviewLive(handlers: {
           resolve?.(null);
         } else if (msg.type === 'preview_status') handlersRef.current.onPreviewStatus(msg);
         else if (msg.type === 'clip_status') handlersRef.current.onClipStatus(msg);
+        else if (msg.type === 'unlock_status') handlersRef.current.onUnlockStatus?.(msg);
       };
 
       socket.onclose = () => {

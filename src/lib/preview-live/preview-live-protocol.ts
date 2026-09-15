@@ -22,6 +22,8 @@ export interface PreviewTrack {
   durationSec: number;
   queuePosition: number;
   error: string | null;
+  /** User clicked 「解锁母带」 on this preview page; MCP may download the master. */
+  unlocked: boolean;
 }
 
 export type PreviewLiveClientMessage =
@@ -53,4 +55,5 @@ export type PreviewLiveServerMessage =
       durationSec?: number;
       createdAt?: string;
     }
+  | { type: 'unlock_status'; clipId: string; unlocked: boolean }
   | { type: 'pong' };

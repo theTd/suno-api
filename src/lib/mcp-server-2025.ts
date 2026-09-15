@@ -4,21 +4,31 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerRequest, ServerNotification } from "@modelcontextprotocol/sdk/types.js";
 import { InMemoryTaskStore, InMemoryTaskMessageQueue } from "@modelcontextprotocol/sdk/experimental/tasks/stores/in-memory.js";
 import { z } from "zod/v4";
-import { DEFAULT_MODEL, isUnusableAudioUrl, rewriteForbiddenAudioUrls, sunoApi } from "./SunoApi";
+import { ClipAudioNotReadyError, DEFAULT_MODEL, isUnusableAudioUrl, rewriteForbiddenAudioUrls, sunoApi } from "./SunoApi";
 import type { PreviewJobSnapshot } from "./SunoApi";
 import { parseGenerationExtras } from "./generation-options";
+import { publicOriginFromEnv } from "./public-origin";
+import { hasUnlockConsent } from "./unlock-consent";
 
 type SunoClient = Awaited<ReturnType<typeof sunoApi>>;
 
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
-// ─── Session Cookie Store ────────────────────────────────────────────
+// ─── Session Cookie / Origin Store ───────────────────────────────────
 
 /** Maps MCP sessionId to the cookie string captured at connection time. */
 export const sessionCookieStore = new Map<string, string>();
+/** Maps MCP sessionId to the public origin of the connecting client. */
+export const sessionOriginStore = new Map<string, string>();
 
 export function getSessionCookies(sessionId: string | undefined): string {
   return sessionId ? sessionCookieStore.get(sessionId) ?? "" : "";
+}
+
+export function getSessionOrigin(sessionId: string | undefined): string {
+  const env = publicOriginFromEnv();
+  if (env) return env;
+  return sessionId ? sessionOriginStore.get(sessionId) ?? "" : "";
 }
 
 // ─── Shared Task Infrastructure ──────────────────────────────────────
@@ -30,20 +40,92 @@ const taskStore = new InMemoryTaskStore();
 const MAX_EMBED_AUDIO_BYTES = 2 * 1024 * 1024;
 
 function clipMetaText(clip: any): string {
+  const id = clip.id ? String(clip.id) : undefined;
   return JSON.stringify({
-    id: clip.id,
+    id,
     title: clip.title,
     status: clip.status,
     duration: clip.duration,
     audio_url: clip.audio_url,
+    unlocked: id ? hasUnlockConsent(id) : false,
   });
+}
+
+function extFromContentType(contentType: string): string {
+  if (contentType.includes("webm")) return "webm";
+  if (contentType.includes("wav")) return "wav";
+  if (contentType.includes("mp4")) return "m4a";
+  return "mp3";
+}
+
+async function handleMasterDownload(args: any, extra: ToolExtra): Promise<CallToolResult> {
+  const clipId = String(args.clip_id);
+  if (!hasUnlockConsent(clipId)) return previewUnlockRequiredError(clipId);
+  const cookies = getSessionCookies(extra.sessionId);
+  const api = await sunoApi(cookies);
+  try {
+    return await buildMasterDownloadResult(api, clipId, getSessionOrigin(extra.sessionId));
+  } catch (err: any) {
+    if (err instanceof ClipAudioNotReadyError) {
+      return buildToolError(
+        `Clip ${clipId} is authorized to unlock but the master is not ready yet (status must be complete). ` +
+          `Wait and retry download_audio_file; the user does not need to click 「解锁母带」 again.`
+      );
+    }
+    return buildToolError(err?.message || String(err));
+  }
+}
+
+function previewUnlockRequiredError(clipId: string): CallToolResult {
+  return buildToolError(
+    `Clip ${clipId} has not been unlocked on the preview page. ` +
+      `Tell the user to open /mcp/preview, listen, and click 「解锁母带」. ` +
+      `Only call this tool after get_audio_info shows unlocked=true for this id, ` +
+      `or the user confirms they clicked unlock.`
+  );
+}
+
+async function buildMasterDownloadResult(
+  api: SunoClient,
+  clipId: string,
+  origin: string
+): Promise<CallToolResult> {
+  const { buffer, contentType } = await api.getPlayableAudio(clipId);
+  const ext = extFromContentType(contentType);
+  const filename = `${clipId}.${ext}`;
+  const fileUrl = origin ? `${origin}/api/file/${clipId}` : null;
+  const content: CallToolResult["content"] = [
+    {
+      type: "text",
+      text: JSON.stringify({
+        id: clipId,
+        unlocked: true,
+        bytes: buffer.length,
+        contentType,
+        file_url: fileUrl,
+      }),
+    },
+  ];
+  if (buffer.length <= MAX_EMBED_AUDIO_BYTES && contentType.startsWith("audio/")) {
+    content.push({ type: "audio", data: buffer.toString("base64"), mimeType: contentType });
+  }
+  if (fileUrl) {
+    content.push({
+      type: "resource_link",
+      uri: fileUrl,
+      name: filename,
+      mimeType: contentType,
+      description: "Unlocked master download",
+    });
+  }
+  return { content, isError: false };
 }
 
 async function buildToolResult(
   toolResult: unknown,
-  opts?: { api?: SunoClient; embedAudio?: boolean }
+  opts?: { api?: SunoClient; embedAudio?: boolean; sessionId?: string }
 ): Promise<CallToolResult> {
-  const origin = (process.env.SUNO_PUBLIC_BASE_URL || "").replace(/\/$/, "");
+  const origin = getSessionOrigin(opts?.sessionId);
   toolResult = origin ? rewriteForbiddenAudioUrls(toolResult, origin) : toolResult;
   if (Array.isArray(toolResult) && toolResult.length > 0) {
     const first = toolResult[0];
@@ -255,7 +337,7 @@ async function runGenerationTool(
     // Only generate_sound still supports the wait_audio/embed mode (default on);
     // song tools always return immediately and never embed preview audio.
     const embedAudio = toolName === "generate_sound" && args.wait_audio !== false;
-    return buildToolResult(result, { api, embedAudio });
+    return buildToolResult(result, { api, embedAudio, sessionId });
   } catch (err: any) {
     return buildToolError(err.message || String(err));
   }
@@ -399,7 +481,8 @@ export function createMcpServer(): McpServer {
         "Routing: generate_music takes a STYLE/THEME description and auto-writes lyrics — never put full lyrics there. " +
         "generate_custom_music takes full LYRICS in `prompt`, with style/genre in `tags` and a `title` (all three required). " +
         "Use generate_sound for sound effects, extend_audio to extend existing clips, " +
-        "or the query tools (get_audio_info, get_account_limit) for read-only operations.",
+        "or the query tools (get_audio_info, get_account_limit) for read-only operations. " +
+        "Do NOT call download_audio or download_audio_file until the user has clicked 「解锁母带」 on /mcp/preview for that clip.",
       taskStore,
       taskMessageQueue: new InMemoryTaskMessageQueue(),
       defaultTaskPollInterval: 5000,
@@ -430,7 +513,7 @@ export function createMcpServer(): McpServer {
         extra.signal,
         extrasFromArgs(args)
       );
-      return buildToolResult(result, { api });
+      return buildToolResult(result, { api, sessionId: extra.sessionId });
     }
   );
 
@@ -460,7 +543,7 @@ export function createMcpServer(): McpServer {
         extra.signal,
         extrasFromArgs(args)
       );
-      return buildToolResult(result, { api });
+      return buildToolResult(result, { api, sessionId: extra.sessionId });
     }
   );
 
@@ -489,7 +572,7 @@ export function createMcpServer(): McpServer {
         false,
         extra.signal
       );
-      return buildToolResult(result, { api });
+      return buildToolResult(result, { api, sessionId: extra.sessionId });
     }
   );
 
@@ -513,7 +596,7 @@ export function createMcpServer(): McpServer {
       const cookies = getSessionCookies(extra.sessionId);
       const api = await sunoApi(cookies);
       const result = await api.concatenate(String(args.clip_id));
-      return buildToolResult(result);
+      return buildToolResult(result, { sessionId: extra.sessionId });
     }
   );
 
@@ -532,7 +615,7 @@ export function createMcpServer(): McpServer {
       const cookies = getSessionCookies(extra.sessionId);
       const api = await sunoApi(cookies);
       const result = await api.generateLyrics(String(args.prompt));
-      return buildToolResult(result);
+      return buildToolResult(result, { sessionId: extra.sessionId });
     }
   );
 
@@ -557,7 +640,7 @@ export function createMcpServer(): McpServer {
         : undefined;
       const page = args.page ? String(args.page) : undefined;
       const result = await api.get(ids, page ?? null);
-      return buildToolResult(result);
+      return buildToolResult(result, { sessionId: extra.sessionId });
     }
   );
 
@@ -574,7 +657,7 @@ export function createMcpServer(): McpServer {
       const cookies = getSessionCookies(extra.sessionId);
       const api = await sunoApi(cookies);
       const result = await api.get_credits();
-      return buildToolResult(result);
+      return buildToolResult(result, { sessionId: extra.sessionId });
     }
   );
 
@@ -600,7 +683,7 @@ export function createMcpServer(): McpServer {
         args.key ? String(args.key) : undefined,
         extra.signal
       );
-      return buildToolResult(result, { api, embedAudio: waitAudio });
+      return buildToolResult(result, { api, embedAudio: waitAudio, sessionId: extra.sessionId });
     }
   );
 
@@ -610,39 +693,33 @@ export function createMcpServer(): McpServer {
     {
       title: "Unlock & Download Audio",
       description:
-        "Unlock a completed clip and download the master file. Consumes a Premier download credit if the clip is not already unlocked. Use after previewing.",
+        "Download a clip's unlocked master file. ONLY call this after the user has clicked 「解锁母带」 on /mcp/preview for this clip. " +
+        "Refuses if preview unlock consent is missing. Consumes a Premier download credit if Suno has not already unlocked the clip.",
       inputSchema: {
-        clip_id: z.string().describe("ID of the clip to unlock and download"),
+        clip_id: z.string().describe("ID of the clip to download. Requires prior preview-page unlock consent."),
       },
       annotations: GENERATION_ANNOTATIONS,
     },
-    async (args: any, extra: ToolExtra) => {
-      const cookies = getSessionCookies(extra.sessionId);
-      const api = await sunoApi(cookies);
-      const clipId = String(args.clip_id);
-      try {
-        const { buffer, contentType } = await api.getPlayableAudio(clipId);
-        const origin = (process.env.SUNO_PUBLIC_BASE_URL || "").replace(/\/$/, "");
-        const content: CallToolResult["content"] = [
-          { type: "text", text: JSON.stringify({ id: clipId, unlocked: true, bytes: buffer.length, contentType }) },
-        ];
-        if (buffer.length <= MAX_EMBED_AUDIO_BYTES && contentType.startsWith("audio/")) {
-          content.push({ type: "audio", data: buffer.toString("base64"), mimeType: contentType });
-        }
-        if (origin) {
-          content.push({
-            type: "resource_link",
-            uri: `${origin}/api/file/${clipId}`,
-            name: `${clipId}.mp3`,
-            mimeType: contentType,
-            description: "Unlocked master download",
-          });
-        }
-        return { content, isError: false };
-      } catch (err: any) {
-        return buildToolError(err?.message || String(err));
-      }
-    }
+    handleMasterDownload
+  );
+
+  // ─── Tool 9b: download_audio_file ──────────────────────────────────
+  server.registerTool(
+    "download_audio_file",
+    {
+      title: "Download Unlocked Audio File",
+      description:
+        "Download the master audio binary for a clip that the user has already unlocked on /mcp/preview. " +
+        "HARD REQUIREMENT: the user must click 「解锁母带」 on the preview page first. Do not call this because a clip finished generating, " +
+        "because get_audio_info returned an id, or because you want to be helpful — only after explicit preview unlock consent " +
+        "(get_audio_info.unlocked=true, or the user says they clicked unlock). " +
+        "Returns file_url (/api/file/{id}) — the only HTTP download path — and audio bytes when small enough.",
+      inputSchema: {
+        clip_id: z.string().describe("ID of the clip whose master file to fetch. Requires prior preview-page unlock consent."),
+      },
+      annotations: GENERATION_ANNOTATIONS,
+    },
+    handleMasterDownload
   );
 
   // ─── Tool 10: generate_stems ────────────────────────────────────────
@@ -661,7 +738,7 @@ export function createMcpServer(): McpServer {
       const cookies = getSessionCookies(extra.sessionId);
       const api = await sunoApi(cookies);
       const result = await api.generateStems(String(args.song_id));
-      return buildToolResult(result);
+      return buildToolResult(result, { sessionId: extra.sessionId });
     }
   );
 
@@ -680,7 +757,7 @@ export function createMcpServer(): McpServer {
       const cookies = getSessionCookies(extra.sessionId);
       const api = await sunoApi(cookies);
       const result = await api.getLyricAlignment(String(args.song_id));
-      return buildToolResult(result);
+      return buildToolResult(result, { sessionId: extra.sessionId });
     }
   );
 
@@ -705,7 +782,7 @@ export function createMcpServer(): McpServer {
         return { contents: [{ uri: uri.href, text: "Missing clip_id in suno://preview/{clip_id}" }] };
       }
       const api = await sunoApi(getSessionCookies(undefined));
-      const origin = (process.env.SUNO_PUBLIC_BASE_URL || "").replace(/\/$/, "");
+      const origin = getSessionOrigin(undefined);
       const status = api.previewJobStatus(clipId);
       const text = JSON.stringify(
         {

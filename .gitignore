@@ -45,3 +45,5 @@ CLAUDE.md
 .captcha-verify/
 scripts/verify-captcha-ui*.cjs
 scripts/verify-turnstile.cjs
+public/downloads/*
+!public/downloads/.gitkeep

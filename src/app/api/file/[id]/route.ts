@@ -1,20 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { ClipAudioNotReadyError, sunoApi } from '@/lib/SunoApi';
+import { masterFileAccessDenied } from '@/lib/master-file-access';
 import { corsHeaders } from '@/lib/utils';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
-
-const CLIP_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export async function GET(
   req: NextRequest,
   { params }: { params: { id: string } }
 ) {
   const clipId = params.id;
-  if (!CLIP_ID.test(clipId)) {
-    return NextResponse.json({ error: 'Invalid clip id' }, { status: 400, headers: corsHeaders });
+  const denied = masterFileAccessDenied(clipId);
+  if (denied) {
+    return NextResponse.json({ error: denied.error }, { status: denied.status, headers: corsHeaders });
   }
 
   try {

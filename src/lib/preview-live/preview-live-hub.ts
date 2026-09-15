@@ -169,6 +169,14 @@ class PreviewLiveHub {
         durationSec: event.durationSec,
         createdAt: event.createdAt
       });
+      return;
+    }
+    if (event.type === 'unlock-status') {
+      this.broadcastAll({
+        type: 'unlock_status',
+        clipId: event.clipId,
+        unlocked: event.unlocked
+      });
     }
   }
 

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
 import type { PreviewLiveServerMessage, PreviewState, PreviewTrack } from '@/lib/preview-live/preview-live-protocol';
+import { mergeUnlocked } from '@/lib/preview-unlock-flags';
 import { useMseAudio } from './useMseAudio';
 import { usePreviewLive } from './usePreviewLive';
 
@@ -59,7 +60,8 @@ function mergeClip(old: TrackView | undefined, incoming: TrackView): TrackView {
     progressPercent: keepOldHarvest ? old.progressPercent : incoming.progressPercent,
     currentSec: keepOldHarvest ? old.currentSec : incoming.currentSec,
     queuePosition: keepOldHarvest ? old.queuePosition : incoming.queuePosition,
-    error: keepOldHarvest ? old.error : incoming.error
+    error: keepOldHarvest ? old.error : incoming.error,
+    unlocked: mergeUnlocked(incoming.unlocked)
   };
 }
 
@@ -105,7 +107,8 @@ function applyClipStatus(
     preview,
     title: msg.title || view.title,
     durationSec: msg.durationSec || view.durationSec,
-    createdAt: msg.createdAt ?? view.createdAt
+    createdAt: msg.createdAt ?? view.createdAt,
+    unlocked: view.unlocked === true
   };
 }
 
@@ -144,6 +147,7 @@ export default function PreviewDeck() {
   const [volume, setVolume] = useState(1);
   const [hasMore, setHasMore] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [unlockingId, setUnlockingId] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const barRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
@@ -158,6 +162,10 @@ export default function PreviewDeck() {
   const lastLoadedPageIdsRef = useRef<Set<string>>(new Set());
   /** 曾经拿到过空页，列表在当时已覆盖到 feed 尽头；之后的整页 duplicate 视为补洞追上。 */
   const reachedEndRef = useRef(false);
+
+  useEffect(() => {
+    fetch('/api/preview-unlock-session', { credentials: 'same-origin', cache: 'no-store' }).catch(() => {});
+  }, []);
 
   const currentTrack = tracks.find((t) => t.id === currentId) ?? null;
   // 串流是线性直播流，浏览器读不到 duration；优先用曲目元数据里的已知时长
@@ -200,6 +208,11 @@ export default function PreviewDeck() {
     },
     onClipStatus: (msg) => {
       setTracks((prev) => prev.map((t) => (t.id === msg.clipId ? applyClipStatus(t, msg) : t)));
+    },
+    onUnlockStatus: (msg) => {
+      setTracks((prev) =>
+        prev.map((t) => (t.id === msg.clipId ? { ...t, unlocked: msg.unlocked } : t))
+      );
     }
   });
 
@@ -447,6 +460,32 @@ export default function PreviewDeck() {
 
   // 媒体错误（如流在首个 chunk 前 502）：复位播放态并提示。
   // 以 src 是否仍存在区分正常路径（stop() 清源）与真实错误。
+  const requestUnlock = useCallback(async (track: TrackView, e: MouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (track.unlocked || unlockingId) return;
+    if (track.status !== 'complete') {
+      setNotice(`《${track.title}》还不能解锁：需要等到生成完成（complete），试听可以继续`);
+      return;
+    }
+    const ok = window.confirm(
+      `解锁《${track.title}》将授权 agent 下载成品母带（可能消耗一次 Premier 下载额度）。确认？`
+    );
+    if (!ok) return;
+    setUnlockingId(track.id);
+    setNotice(null);
+    try {
+      const res = await fetch(`/api/unlock/${track.id}`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `解锁失败 (${res.status})`);
+      setTracks((prev) => prev.map((t) => (t.id === track.id ? { ...t, unlocked: true } : t)));
+    } catch (err: any) {
+      setNotice(`解锁《${track.title}》失败：${err?.message || err}`);
+    } finally {
+      setUnlockingId(null);
+    }
+  }, [unlockingId]);
+
   const handleAudioError = useCallback(() => {
     const audio = audioRef.current;
     if (!audio?.getAttribute('src')) return;
@@ -465,7 +504,7 @@ export default function PreviewDeck() {
           <div>
             <h1 className="text-2xl font-bold">Suno Preview 试听台</h1>
             <p className="mt-1 text-sm text-zinc-400">
-              实时发现可 preview 的音轨 · 点击即渐进试听 · 滚到底部加载全部
+              实时发现可 preview 的音轨 · 点击即渐进试听 · 解锁母带后 agent 才能下载成品
             </p>
           </div>
           <div className="text-xs text-zinc-500">
@@ -491,40 +530,59 @@ export default function PreviewDeck() {
               t.preview === 'waiting_clip' ||
               t.preview === 'queued' ||
               t.preview === 'error';
+            const canUnlock = t.status === 'complete';
             return (
               <li key={t.id}>
-                <button
-                  type="button"
-                  disabled={!clickable}
-                  onClick={() => (active ? stop() : play(t))}
-                  className={`w-full flex items-center justify-between gap-3 rounded-lg border px-4 py-3 text-left transition-colors ${
-                    active
-                      ? 'border-sky-500/50 bg-sky-500/10'
-                      : 'border-zinc-800 bg-zinc-900 hover:border-zinc-600'
-                  } ${clickable ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}
+                <div
+                  className={`flex items-stretch gap-2 rounded-lg border ${
+                    active ? 'border-sky-500/50 bg-sky-500/10' : 'border-zinc-800 bg-zinc-900'
+                  }`}
                 >
-                  <div className="min-w-0">
-                    <div className="truncate font-medium">{t.title}</div>
-                    <div className="mt-0.5 text-xs text-zinc-500">
-                      {active && playing ? '▶ ' : ''}
-                      {t.preview === 'capturing' &&
-                        (t.progressPercent != null
-                          ? `捕获中 ${t.progressPercent.toFixed(1)}%（${fmtTime(t.currentSec)}/${fmtTime(t.durationSec)}）`
-                          : `捕获中 ${fmtTime(t.currentSec)} 已播放`)}
-                      {t.preview === 'capturing' && ' · 可渐进试听'}
-                      {t.preview === 'pending' && '点击后开始捕获并渐进试听'}
-                      {t.preview === 'waiting_clip' && '等待 clip 可试听'}
-                      {t.preview === 'queued' &&
-                        (t.queuePosition > 0 ? `排队第 ${t.queuePosition} 位` : '排队等待捕获')}
-                      {t.preview === 'ready' && '可完整回放'}
-                      {t.preview === 'error' && (t.error || '捕获失败')}
-                      {t.preview === 'generating' && 'Suno 侧生成中，暂不可 preview'}
+                  <button
+                    type="button"
+                    disabled={!clickable}
+                    onClick={() => (active ? stop() : play(t))}
+                    className={`min-w-0 flex-1 flex items-center justify-between gap-3 px-4 py-3 text-left transition-colors ${
+                      clickable ? 'cursor-pointer hover:bg-zinc-800/40' : 'cursor-not-allowed opacity-60'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate font-medium">{t.title}</div>
+                      <div className="mt-0.5 text-xs text-zinc-500">
+                        {active && playing ? '▶ ' : ''}
+                        {t.preview === 'capturing' &&
+                          (t.progressPercent != null
+                            ? `捕获中 ${t.progressPercent.toFixed(1)}%（${fmtTime(t.currentSec)}/${fmtTime(t.durationSec)}）`
+                            : `捕获中 ${fmtTime(t.currentSec)} 已播放`)}
+                        {t.preview === 'capturing' && ' · 可渐进试听'}
+                        {t.preview === 'pending' && '点击后开始捕获并渐进试听'}
+                        {t.preview === 'waiting_clip' && '等待 clip 可试听'}
+                        {t.preview === 'queued' &&
+                          (t.queuePosition > 0 ? `排队第 ${t.queuePosition} 位` : '排队等待捕获')}
+                        {t.preview === 'ready' && '可完整回放'}
+                        {t.preview === 'error' && (t.error || '捕获失败')}
+                        {t.preview === 'generating' && 'Suno 侧生成中，暂不可 preview'}
+                      </div>
                     </div>
-                  </div>
-                  <span className={`shrink-0 rounded-full border px-2.5 py-1 text-xs ${badgeClass(t.preview)}`}>
-                    {PREVIEW_LABEL[t.preview]}
-                  </span>
-                </button>
+                    <span className={`shrink-0 rounded-full border px-2.5 py-1 text-xs ${badgeClass(t.preview)}`}>
+                      {PREVIEW_LABEL[t.preview]}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!canUnlock || t.unlocked || unlockingId === t.id}
+                    onClick={(e) => requestUnlock(t, e)}
+                    className={`shrink-0 self-center mr-2 rounded-full border px-2.5 py-1 text-xs transition-colors ${
+                      t.unlocked
+                        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                        : canUnlock
+                          ? 'border-amber-500/40 text-amber-200 hover:bg-amber-500/10'
+                          : 'border-zinc-700 text-zinc-500 cursor-not-allowed'
+                    }`}
+                  >
+                    {t.unlocked ? '已解锁' : unlockingId === t.id ? '解锁中…' : '解锁母带'}
+                  </button>
+                </div>
               </li>
             );
           })}

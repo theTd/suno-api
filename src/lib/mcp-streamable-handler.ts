@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { createMcpServer, sessionCookieStore } from "@/lib/mcp-server-2025";
+import { createMcpServer, sessionCookieStore, sessionOriginStore } from "@/lib/mcp-server-2025";
+import { publicOriginFromRequest } from "@/lib/public-origin";
 import { InMemoryEventStore } from "@/lib/inMemoryEventStore";
 import { buildCorsHeaders } from "@/lib/utils";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
@@ -135,10 +136,12 @@ export async function handleMcpRequest(req: NextRequest): Promise<Response> {
       onsessioninitialized: (sid) => {
         transports.set(sid, transport);
         sessionCookieStore.set(sid, cookieStr);
+        sessionOriginStore.set(sid, publicOriginFromRequest(req));
       },
       onsessionclosed: (sid) => {
         transports.delete(sid);
         sessionCookieStore.delete(sid);
+        sessionOriginStore.delete(sid);
       },
     });
 
@@ -147,6 +150,7 @@ export async function handleMcpRequest(req: NextRequest): Promise<Response> {
       if (sid) {
         transports.delete(sid);
         sessionCookieStore.delete(sid);
+        sessionOriginStore.delete(sid);
       }
     };
 
@@ -168,6 +172,7 @@ export async function handleMcpRequest(req: NextRequest): Promise<Response> {
       if (sid) {
         transports.delete(sid);
         sessionCookieStore.delete(sid);
+        sessionOriginStore.delete(sid);
       }
       return jsonRpcError(-32000, err.message || "Internal error", 500, req);
     }
@@ -211,6 +216,7 @@ export async function handleMcpDelete(req: NextRequest): Promise<Response> {
   } finally {
     transports.delete(sessionId);
     sessionCookieStore.delete(sessionId);
+    sessionOriginStore.delete(sessionId);
   }
 
   return response;

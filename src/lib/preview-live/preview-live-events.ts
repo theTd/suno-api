@@ -28,7 +28,8 @@ export type PreviewLiveEvent =
       title?: string;
       durationSec?: number;
       createdAt?: string;
-    };
+    }
+  | { type: 'unlock-status'; clipId: string; unlocked: boolean };
 
 const globalForPreviewLive = globalThis as unknown as {
   sunoPreviewLiveBus?: EventEmitter;

@@ -1,5 +1,6 @@
 import type { AudioInfo, PreviewJobSnapshot } from '@/lib/SunoApi';
 import type { PreviewState, PreviewTrack } from '@/lib/preview-live/preview-live-protocol';
+import { hasUnlockConsent } from '@/lib/unlock-consent';
 
 export type PreviewTrackLookup = {
   hasCachedPreview(clipId: string): boolean;
@@ -68,7 +69,8 @@ export function clipToPreviewTrack(clip: AudioInfo, api: PreviewTrackLookup): Pr
     currentSec,
     durationSec,
     queuePosition,
-    error
+    error,
+    unlocked: hasUnlockConsent(id)
   };
 }
 

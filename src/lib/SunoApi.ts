@@ -15,6 +15,7 @@ import { promises as fs } from 'fs';
 import { Readable } from 'stream';
 import path from 'node:path';
 import os from 'node:os';
+import { emitPreviewLiveEvent } from '@/lib/preview-live/preview-live-events';
 
 // sunoApi instance caching
 const globalForSunoApi = global as unknown as { sunoApiCache?: Map<string, SunoApi> };
@@ -38,7 +39,7 @@ const PREVIEW_ERROR_TTL_MS = 30 * 1000;
 const PREVIEW_RESULT_TTL_MS = 10 * 60 * 1000;
 /** Reuse a Clerk JWT until this close to expiry instead of POSTing tokens every call. */
 const KEEPALIVE_RENEW_SKEW_MS = 15 * 1000;
-/** Feed listing (`get()` without ids) is polled by the preview deck; short TTL coalesces it. */
+/** Feed listing (`get()` without ids): short TTL coalesces HTTP / MCP callers. The preview-live watch uses `{ fresh: true }`. */
 const FEED_LIST_TTL_MS = 10 * 1000;
 
 export type PreviewJobPhase = 'waiting_clip' | 'queued' | 'capturing' | 'error';
@@ -81,6 +82,9 @@ const globalForHarvest = global as unknown as {
   sunoPreviewResults?: Map<string, { buffer: Buffer; expiresAt: number }>;
   sunoPlaywrightHarvest?: Promise<unknown>;
   sunoHarvestWaitList?: string[];
+  sunoPreviewCacheIndex?: Set<string>;
+  sunoPreviewCacheIndexLoaded?: boolean;
+  sunoPreviewCacheIndexPromise?: Promise<void>;
 };
 const harvestLocks = globalForHarvest.sunoAudioHarvest || new Map<string, Promise<Buffer>>();
 globalForHarvest.sunoAudioHarvest = harvestLocks;
@@ -90,6 +94,8 @@ const previewResults = globalForHarvest.sunoPreviewResults || new Map<string, { 
 globalForHarvest.sunoPreviewResults = previewResults;
 if (!globalForHarvest.sunoPlaywrightHarvest)
   globalForHarvest.sunoPlaywrightHarvest = Promise.resolve();
+const previewCacheIndex = globalForHarvest.sunoPreviewCacheIndex || new Set<string>();
+globalForHarvest.sunoPreviewCacheIndex = previewCacheIndex;
 
 export class ClipAudioNotReadyError extends Error {
   statusCode = 409;
@@ -447,6 +453,7 @@ class SunoApi {
   private feedListCache?: { key: string; at: number; data: AudioInfo[] };
   private feedListEpoch = 0;
   private feedInflight = new Map<string, Promise<AudioInfo[]>>();
+  private readonly cookieKey: string;
 
   /** Drop cached feed pages so the next list poll hits Suno after a create. */
   private invalidateFeedListCache() {
@@ -456,9 +463,15 @@ class SunoApi {
       // list keys are `${page}\0` with empty ids
       if (key.endsWith('\0')) this.feedInflight.delete(key);
     }
+    emitPreviewLiveEvent({ type: 'feed-invalidated', cookieKey: this.cookieKey });
+  }
+
+  public getCookieKey(): string {
+    return this.cookieKey;
   }
 
   constructor(cookies: string) {
+    this.cookieKey = cookies;
     this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
     this.cookies = cookie.parse(cookies);
     this.deviceId = this.cookies.ajs_anonymous_id || randomUUID();
@@ -1889,12 +1902,13 @@ class SunoApi {
    */
   public async get(
     songIds?: string[],
-    page?: string | null
+    page?: string | null,
+    opts?: { fresh?: boolean }
   ): Promise<AudioInfo[]> {
     const key = `${page ?? ''}\0${(songIds ?? []).join(',')}`;
     const listMode = !songIds?.length;
     const epoch = this.feedListEpoch;
-    if (listMode) {
+    if (listMode && !opts?.fresh) {
       const hit = this.feedListCache;
       if (hit && hit.key === key && Date.now() - hit.at < FEED_LIST_TTL_MS) {
         return hit.data;
@@ -2006,6 +2020,51 @@ class SunoApi {
     return this.readPreviewResult(clipId);
   }
 
+  /** Cheap ready check for the live deck; does not read the audio bytes. */
+  public hasCachedPreview(clipId: string): boolean {
+    const entry = previewResults.get(clipId);
+    if (entry && entry.expiresAt > Date.now()) return true;
+    return previewCacheIndex.has(clipId);
+  }
+
+  public async ensurePreviewCacheIndex(): Promise<void> {
+    if (globalForHarvest.sunoPreviewCacheIndexLoaded) return;
+    if (!globalForHarvest.sunoPreviewCacheIndexPromise) {
+      globalForHarvest.sunoPreviewCacheIndexPromise = (async () => {
+        try {
+          const names = await fs.readdir(PREVIEW_CACHE_DIR);
+          for (const name of names) {
+            if (name.endsWith('.bin')) previewCacheIndex.add(name.slice(0, -'.bin'.length));
+          }
+        } catch {
+          // cache dir may not exist yet
+        }
+        globalForHarvest.sunoPreviewCacheIndexLoaded = true;
+      })();
+    }
+    await globalForHarvest.sunoPreviewCacheIndexPromise;
+  }
+
+  private emitPreviewJob(clipId: string): void {
+    const snap = this.previewJobStatus(clipId);
+    if (!snap) return;
+    emitPreviewLiveEvent({
+      type: 'preview-job',
+      clipId,
+      state: snap.state,
+      queuePosition: snap.queuePosition,
+      progressPercent: snap.progressPercent,
+      currentSec: snap.currentSec,
+      durationSec: snap.durationSec,
+      error: snap.error
+    });
+  }
+
+  private emitQueuedJobPositions(): void {
+    const waitList = globalForHarvest.sunoHarvestWaitList || [];
+    for (const id of waitList) this.emitPreviewJob(id);
+  }
+
   /** In-memory result of a recently completed capture (see PREVIEW_RESULT_TTL_MS). */
   private readPreviewResult(clipId: string): { buffer: Buffer; contentType: string } | null {
     const entry = previewResults.get(clipId);
@@ -2036,6 +2095,7 @@ class SunoApi {
     // Errors are surfaced through previewJobStatus(); never crash the process.
     job.promise.catch(() => {});
     previewJobs.set(clipId, job);
+    this.emitPreviewJob(clipId);
     return job;
   }
 
@@ -2236,12 +2296,15 @@ class SunoApi {
       previewResults.set(clipId, { buffer, expiresAt: now + PREVIEW_RESULT_TTL_MS });
       if (previewJobs.get(clipId) === job) previewJobs.delete(clipId);
       this.emitPreviewEnd(job);
+      emitPreviewLiveEvent({ type: 'preview-ready', clipId });
       return buffer;
     } catch (err: any) {
       job.phase = 'error';
-      job.error = err?.message || String(err);
+      const message = err?.message || String(err);
+      job.error = message;
       this.emitPreviewError(job, err);
-      logger.warn({ clipId, err: job.error }, 'Preview harvest failed');
+      emitPreviewLiveEvent({ type: 'preview-error', clipId, error: message });
+      logger.warn({ clipId, err: message }, 'Preview harvest failed');
       const timer = setTimeout(() => {
         if (previewJobs.get(clipId) === job) previewJobs.delete(clipId);
       }, PREVIEW_ERROR_TTL_MS);
@@ -2282,6 +2345,7 @@ class SunoApi {
     try {
       const buffer = await fs.readFile(previewCachePath(clipId));
       if (!looksLikeAudio(buffer)) return null;
+      previewCacheIndex.add(clipId);
       return { buffer, contentType: this.sniffAudioType(buffer) };
     } catch {
       return null;
@@ -2294,6 +2358,7 @@ class SunoApi {
     const tmp = dest + '.tmp';
     await fs.writeFile(tmp, buffer);
     await fs.rename(tmp, dest);
+    previewCacheIndex.add(clipId);
   }
 
   /**
@@ -2305,12 +2370,14 @@ class SunoApi {
     const g = globalForHarvest;
     const waitList = (g.sunoHarvestWaitList ||= []);
     waitList.push(clipId);
+    this.emitQueuedJobPositions();
     const previous = g.sunoPlaywrightHarvest || Promise.resolve();
     let release!: () => void;
     g.sunoPlaywrightHarvest = new Promise<void>((resolve) => { release = resolve; });
     await previous.catch(() => {});
     const idx = waitList.indexOf(clipId);
     if (idx >= 0) waitList.splice(idx, 1);
+    this.emitQueuedJobPositions();
     let released = false;
     return () => {
       if (released) return;
@@ -2333,14 +2400,21 @@ class SunoApi {
         const status = clip?.status;
         if (status === 'complete' || status === 'streaming') {
           const rawDuration = Number(clip?.duration);
-          return {
+          const durationSec = Number.isFinite(rawDuration) && rawDuration > 0 ? rawDuration : undefined;
+          emitPreviewLiveEvent({
+            type: 'clip-status',
+            clipId,
             status,
-            durationSec: Number.isFinite(rawDuration) && rawDuration > 0 ? rawDuration : undefined
-          };
+            title: clip?.title,
+            durationSec,
+            createdAt: clip?.created_at
+          });
+          return { status, durationSec };
         }
         if (status === 'error')
           throw new ClipAudioNotReadyError('Clip generation failed');
         job.phase = 'waiting_clip';
+        this.emitPreviewJob(clipId);
       } catch (err: any) {
         if (err instanceof ClipAudioNotReadyError) throw err;
         sawTransientError = true;
@@ -2358,8 +2432,10 @@ class SunoApi {
     const ready = await this.waitForPreviewReady(clipId, job);
     logger.info('Capturing in-player preview (no unlock): ' + clipId);
     job.phase = 'queued';
+    this.emitPreviewJob(clipId);
     const release = await this.acquireHarvestSlot(clipId);
     job.phase = 'capturing';
+    this.emitPreviewJob(clipId);
     try {
       const watchdogMs = Math.min(
         PREVIEW_CAPTURE_MAX_MS,
@@ -2470,6 +2546,7 @@ class SunoApi {
           job.currentSec = playback.t;
           if (playback.d > 0) job.durationSec = playback.d;
           job.bytes = playback.bytes;
+          this.emitPreviewJob(clipId);
         }
         if (playback && playback.t > 0.2 && playback.paused)
           await page.evaluate(async () => {
@@ -2730,8 +2807,34 @@ class SunoApi {
   }
 }
 
+/**
+ * Same serialization as Next `cookies().toString()`: decode then
+ * encodeURIComponent each value so WS Cookie headers and HTTP route
+ * cookies share one sunoApi cache / preview-live room key.
+ */
+export function normalizeCookieHeader(cookie?: string): string | undefined {
+  if (!cookie) return cookie;
+  const pairs: { name: string; encoded: string }[] = [];
+  for (const part of cookie.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    const name = part.slice(0, idx).trim();
+    if (!name) continue;
+    let value = part.slice(idx + 1).trim();
+    try {
+      value = decodeURIComponent(value);
+    } catch {
+      // already raw
+    }
+    pairs.push({ name, encoded: `${name}=${encodeURIComponent(value)}` });
+  }
+  pairs.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return pairs.map((p) => p.encoded).join('; ');
+}
+
 export const sunoApi = async (cookie?: string) => {
-  const resolvedCookie = cookie && cookie.includes('__client') ? cookie : process.env.SUNO_COOKIE; // Check for bad `Cookie` header (It's too expensive to actually parse the cookies *here*)
+  const normalized = normalizeCookieHeader(cookie);
+  const resolvedCookie = normalized && normalized.includes('__client') ? normalized : process.env.SUNO_COOKIE;
   if (!resolvedCookie) {
     logger.info('No cookie provided! Aborting...\nPlease provide a cookie either in the .env file or in the Cookie header of your request.')
     throw new Error('Please provide a cookie either in the .env file or in the Cookie header of your request.');

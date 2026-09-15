@@ -1,58 +1,34 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
+import type { PreviewLiveServerMessage, PreviewState, PreviewTrack } from '@/lib/preview-live/preview-live-protocol';
 import { useMseAudio } from './useMseAudio';
+import { usePreviewLive } from './usePreviewLive';
 
 /**
  * Preview 试听台（协议层消费者）：
- * - 轮询 /api/get?page=1 第一时间发现新的可 preview 音轨（status = complete | streaming）
- * - 历史音轨按页增量加载：滚到列表底部再请求下一页，轮询只合并第一页、不丢已加载页
+ * - WebSocket `/mcp/preview/live` 推送第一页与捕获状态；浏览器不再轮询 /api/get 或探测 /api/preview/{id}
+ * - 历史音轨按页增量加载：滚到列表底部再经 WS 请求下一页，page1 推送只合并第一页、不丢已加载页
  * - 翻页尽头只认空页，或连续两页/与第一页 id 集相同（page 参数被忽略）
  * - 整页 duplicate 但与第一页不同 = feed 窗口滑动，继续翻；若曾翻到空页则视为补洞追上、停止
- * - 第一页轮询出现从未见过的 id 且曾经以为翻完时，重开翻页（loadedPage 回到 1，下一拍拉 page=2）补中间页
- * - clip 一旦 complete/streaming，立即标 pending 并可点（不依赖探测）
- * - 对可 preview 音轨探测 /api/preview/{id}，细化三态：
- *     capturing → 正在串流的 preview（可渐进试听）
- *     ready     → 已缓存完整（立即完整回放）
- *     pending   → 待捕获（点击后才开始捕获并渐进试听）
- * - 试听一律走 /api/preview/{id}?stream=1（chunked 渐进流），三种状态同一入口
- * - 播放器为自绘控件：串流是线性直播流（Accept-Ranges: none），浏览器读不到
- *   duration、原生 <audio controls> 不显示进度且不可定位；这里改用已知音轨时长
- *   绘制进度/缓冲条。串流经 MSE（useMseAudio）接管：chunk 追加进 SourceBuffer
- *   后，已捕获部分（如捕获 60% 时其之前）可自由回跳，EOF 后全长可定位；MSE
- *   不可用/类型不支持时回退直接 src（浏览器视为直播，seek 不生效）。ready 音轨
- *   走支持 Range 的完整缓存 URL，可完整 seek（回退路径捕获完成后仍热切换升级）
+ * - 第一页出现从未见过的 id 且曾经以为翻完时，重开翻页（loadedPage 回到 1，下一拍拉 page=2）补中间页
+ * - clip 一旦 complete/streaming，立即标 pending 并可点
+ * - 试听一律走 /api/preview/{id}?stream=1（chunked 渐进流）；ready 走完整缓存 URL
+ * - 播放器为自绘控件：串流经 MSE（useMseAudio）接管
  *
- * 注意：探测 /api/preview/{id} 是只读的，不会启动后台捕获——缓冲只在真正
- * 试听（?stream=1）时触发。探测只细化 pending/capturing/ready/error 徽章，
- * 不得把未探测到的 complete 音轨当成「生成中」禁用点击。
+ * 捕获仍只在真正试听（?stream=1）时启动；实时通道只推状态，不替用户开播。
  */
 
-type PreviewState = 'generating' | 'pending' | 'capturing' | 'ready' | 'error';
+type TrackView = PreviewTrack;
 
-interface TrackView {
-  id: string;
-  title: string;
-  status: string;
-  createdAt?: string;
-  preview: PreviewState;
-  progressPercent: number | null;
-  currentSec: number;
-  durationSec: number;
-  error: string | null;
-}
-
-const POLL_MS = 5000;
-const STATUS_POLL_MS = 3000;
 /** 下一页加载失败后的冷却，避免 sentinel 仍在视口内时对错误页空转。 */
 const LOAD_MORE_ERROR_COOLDOWN_MS = 2000;
-/** 自动探测条数上限。探测已缓存音轨会收到 200 二进制体再 cancel，不能对整页狂打。
- *  未探测到的 complete 音轨仍是 pending、可点，不依赖这个上限。 */
-const PROBE_TOP_N = 3;
 
 const PREVIEW_LABEL: Record<PreviewState, string> = {
   generating: '生成中',
   pending: '待捕获',
+  waiting_clip: '等待就绪',
+  queued: '排队中',
   capturing: '串流中',
   ready: '已缓存完整',
   error: '捕获失败'
@@ -62,30 +38,32 @@ function isPreviewableStatus(status: string): boolean {
   return status === 'complete' || status === 'streaming';
 }
 
-function previewFromClipStatus(status: string): PreviewState {
-  return isPreviewableStatus(status) ? 'pending' : 'generating';
-}
-
-/** Keep probe-refined badges; never leave a complete clip stuck as generating. */
-function retainPreview(old: TrackView, status: string): PreviewState {
-  if (!isPreviewableStatus(status)) return 'generating';
-  if (old.preview === 'generating') return 'pending';
-  return old.preview;
+/** page1 快照可能早于刚到的 preview_status；不要把进行中的捕获打回 pending。 */
+function mergePreview(old: PreviewState | undefined, incoming: PreviewState): PreviewState {
+  if (!old) return incoming;
+  if (incoming === 'ready' || incoming === 'error') return incoming;
+  if (incoming === 'capturing' || incoming === 'queued' || incoming === 'waiting_clip') return incoming;
+  if (old === 'waiting_clip' || old === 'queued' || old === 'capturing' || old === 'ready') return old;
+  return incoming;
 }
 
 function mergeClip(old: TrackView | undefined, incoming: TrackView): TrackView {
   if (!old) return incoming;
+  const preview = mergePreview(old.preview, incoming.preview);
+  const keepOldHarvest = preview !== incoming.preview;
   return {
-    ...old,
-    title: incoming.title,
-    status: incoming.status,
-    createdAt: incoming.createdAt ?? old.createdAt,
+    ...incoming,
+    preview,
     durationSec: incoming.durationSec || old.durationSec,
-    preview: retainPreview(old, incoming.status)
+    createdAt: incoming.createdAt ?? old.createdAt,
+    progressPercent: keepOldHarvest ? old.progressPercent : incoming.progressPercent,
+    currentSec: keepOldHarvest ? old.currentSec : incoming.currentSec,
+    queuePosition: keepOldHarvest ? old.queuePosition : incoming.queuePosition,
+    error: keepOldHarvest ? old.error : incoming.error
   };
 }
 
-/** 第一页是最新窗口：放在列表头；已加载的更旧页接到后面，避免轮询冲掉翻页结果。 */
+/** 第一页是最新窗口：放在列表头；已加载的更旧页接到后面，避免 page1 推送冲掉翻页结果。 */
 function mergePage1(prev: TrackView[], fresh: TrackView[]): TrackView[] {
   const prevById = new Map(prev.map((t) => [t.id, t]));
   const freshIds = new Set(fresh.map((t) => t.id));
@@ -99,85 +77,36 @@ function sameIdSet(ids: string[], set: Set<string>): boolean {
   return ids.every((id) => set.has(id));
 }
 
-async function fetchTracksPage(page: number): Promise<TrackView[] | null> {
-  const res = await fetch(`/api/get?page=${page}`, { cache: 'no-store' });
-  if (!res.ok) return null;
-  const data = await res.json().catch(() => null);
-  if (!Array.isArray(data)) return null;
-  return data.map((c: any) => {
-    const status = String(c.status || '');
-    return {
-      id: String(c.id),
-      title: c.title || String(c.id),
-      status,
-      createdAt: c.created_at ? String(c.created_at) : undefined,
-      preview: previewFromClipStatus(status),
-      progressPercent: null,
-      currentSec: 0,
-      durationSec: Number(c.duration) || 0,
-      error: null
-    };
-  });
+function applyPreviewStatus(
+  view: TrackView,
+  msg: Extract<PreviewLiveServerMessage, { type: 'preview_status' }>
+): TrackView {
+  return {
+    ...view,
+    preview: msg.preview,
+    progressPercent: msg.progressPercent,
+    currentSec: msg.currentSec,
+    durationSec: msg.durationSec || view.durationSec,
+    queuePosition: msg.queuePosition,
+    error: msg.error
+  };
 }
 
-type ProbeResult =
-  | { kind: 'cached' }
-  | { kind: 'status'; state: string; progressPercent: number | null; currentSec: number; durationSec: number; error: string | null }
-  | { kind: 'failed'; error: string }
-  | { kind: 'error' };
-
-/** 探测 preview 状态；只读状态码/JSON，200 的二进制体立即取消，不下载。 */
-async function probePreview(clipId: string): Promise<ProbeResult> {
-  try {
-    const res = await fetch(`/api/preview/${clipId}`, { cache: 'no-store' });
-    if (res.status === 200) {
-      await res.body?.cancel();
-      return { kind: 'cached' };
-    }
-    if (res.status === 202) {
-      const j = await res.json().catch(() => null);
-      if (!j) return { kind: 'error' };
-      return {
-        kind: 'status',
-        state: String(j.state || ''),
-        progressPercent: typeof j.progressPercent === 'number' ? j.progressPercent : null,
-        currentSec: Number(j.currentSec) || 0,
-        durationSec: Number(j.durationSec) || 0,
-        error: j.error ? String(j.error) : null
-      };
-    }
-    // 502 等错误响应携带 { error } JSON（服务端 harvest 失败详情），尽量保留
-    const j = await res.json().catch(() => null);
-    if (!res.bodyUsed) await res.body?.cancel().catch(() => {});
-    return { kind: 'failed', error: j?.error ? String(j.error) : `HTTP ${res.status}` };
-  } catch {
-    return { kind: 'error' };
-  }
-}
-
-function applyProbe(view: TrackView, probe: ProbeResult): TrackView {
-  if (probe.kind === 'cached') {
-    return { ...view, preview: 'ready', progressPercent: null, error: null };
-  }
-  if (probe.kind === 'failed') {
-    return { ...view, preview: 'error', error: probe.error };
-  }
-  if (probe.kind === 'status') {
-    if (probe.error) return { ...view, preview: 'error', error: probe.error };
-    if (probe.state === 'capturing') {
-      return {
-        ...view,
-        preview: 'capturing',
-        progressPercent: probe.progressPercent,
-        currentSec: probe.currentSec,
-        durationSec: probe.durationSec,
-        error: null
-      };
-    }
-    // waiting_clip / queued：捕获尚未开始
-    return { ...view, preview: 'pending', progressPercent: null, error: null };
-  }
-  return { ...view, preview: 'error', error: '预览探测失败' };
+function applyClipStatus(
+  view: TrackView,
+  msg: Extract<PreviewLiveServerMessage, { type: 'clip_status' }>
+): TrackView {
+  const status = msg.status;
+  let preview = view.preview;
+  if (isPreviewableStatus(status) && preview === 'generating') preview = 'pending';
+  return {
+    ...view,
+    status,
+    preview,
+    title: msg.title || view.title,
+    durationSec: msg.durationSec || view.durationSec,
+    createdAt: msg.createdAt ?? view.createdAt
+  };
 }
 
 function badgeClass(preview: PreviewState): string {
@@ -187,6 +116,8 @@ function badgeClass(preview: PreviewState): string {
     case 'capturing':
       return 'bg-sky-500/15 text-sky-300 border-sky-500/30';
     case 'pending':
+    case 'waiting_clip':
+    case 'queued':
       return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
     case 'error':
       return 'bg-rose-500/15 text-rose-300 border-rose-500/30';
@@ -206,7 +137,6 @@ export default function PreviewDeck() {
   const [tracks, setTracks] = useState<TrackView[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
-  const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [posSec, setPosSec] = useState(0);
   const [bufferedSec, setBufferedSec] = useState(0);
@@ -217,8 +147,6 @@ export default function PreviewDeck() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const barRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
-  const currentIdRef = useRef<string | null>(null);
-  currentIdRef.current = currentId;
   const tracksRef = useRef<TrackView[]>([]);
   tracksRef.current = tracks;
   const loadedPageRef = useRef(1);
@@ -237,58 +165,43 @@ export default function PreviewDeck() {
   const playedPct = durationSec > 0 ? Math.min(100, (posSec / durationSec) * 100) : 0;
   const bufferedPct = durationSec > 0 ? Math.min(100, (bufferedSec / durationSec) * 100) : 0;
 
-  const refresh = useCallback(async () => {
-    try {
-      const fresh = await fetchTracksPage(1);
-      if (!fresh) return;
-      page1IdsRef.current = new Set(fresh.map((t) => t.id));
-      const prevIds = new Set(tracksRef.current.map((t) => t.id));
-      const hasUnseen = fresh.some((t) => !prevIds.has(t.id));
-      if (fresh.length === 0 && loadedPageRef.current === 1 && prevIds.size === 0) {
-        hasMoreRef.current = false;
-        setHasMore(false);
-        reachedEndRef.current = true;
-      } else if (
-        hasUnseen &&
-        (reachedEndRef.current || !hasMoreRef.current) &&
-        !loadingMoreRef.current
-      ) {
-        // 第一页冒出从未见过的 id，且曾经以为翻完：从 page=2 补中间被滑走的页
-        loadedPageRef.current = 1;
-        lastLoadedPageIdsRef.current = new Set(fresh.map((t) => t.id));
-        hasMoreRef.current = true;
-        setHasMore(true);
-      } else if (loadedPageRef.current === 1 && !reachedEndRef.current) {
-        const more = fresh.length > 0;
-        hasMoreRef.current = more;
-        setHasMore(more);
-      }
-      setTracks((prev) => mergePage1(prev, fresh));
-      bootstrappedRef.current = true;
-      setLastRefresh(new Date());
-
-      // 只读探测最新几条，细化 pending/capturing/ready 徽章（不会触发捕获）。
-      // error 轨道排除：服务端对 errored job 只保留 30s 即删除，之后探测只会
-      // 再拿到 502，对持久失败的 clip 自动轮询没有意义（点击播放仍是手动重试入口）。
-      const knownById = new Map(tracksRef.current.map((t) => [t.id, t]));
-      const probeable = fresh.filter((t) => isPreviewableStatus(t.status));
-      const targets = new Set(
-        probeable
-          .slice(0, PROBE_TOP_N)
-          .filter((t) => knownById.get(t.id)?.preview !== 'error')
-          .map((t) => t.id)
-      );
-      if (currentIdRef.current) targets.add(currentIdRef.current);
-      await Promise.all(
-        [...targets].map(async (id) => {
-          const probe = await probePreview(id);
-          setTracks((prev) => prev.map((t) => (t.id === id ? applyProbe(t, probe) : t)));
-        })
-      );
-    } catch {
-      // 单次刷新失败可容忍，下个周期重试
+  const applyPage1 = useCallback((fresh: TrackView[]) => {
+    page1IdsRef.current = new Set(fresh.map((t) => t.id));
+    const prevIds = new Set(tracksRef.current.map((t) => t.id));
+    const hasUnseen = fresh.some((t) => !prevIds.has(t.id));
+    if (fresh.length === 0 && loadedPageRef.current === 1 && prevIds.size === 0) {
+      hasMoreRef.current = false;
+      setHasMore(false);
+      reachedEndRef.current = true;
+    } else if (
+      hasUnseen &&
+      (reachedEndRef.current || !hasMoreRef.current) &&
+      !loadingMoreRef.current
+    ) {
+      // 第一页冒出从未见过的 id，且曾经以为翻完：从 page=2 补中间被滑走的页
+      loadedPageRef.current = 1;
+      lastLoadedPageIdsRef.current = new Set(fresh.map((t) => t.id));
+      hasMoreRef.current = true;
+      setHasMore(true);
+    } else if (loadedPageRef.current === 1 && !reachedEndRef.current) {
+      const more = fresh.length > 0;
+      hasMoreRef.current = more;
+      setHasMore(more);
     }
+    setTracks((prev) => mergePage1(prev, fresh));
+    bootstrappedRef.current = true;
   }, []);
+
+  const { connection, lastPush, loadPage } = usePreviewLive({
+    onHello: applyPage1,
+    onPage1: applyPage1,
+    onPreviewStatus: (msg) => {
+      setTracks((prev) => prev.map((t) => (t.id === msg.clipId ? applyPreviewStatus(t, msg) : t)));
+    },
+    onClipStatus: (msg) => {
+      setTracks((prev) => prev.map((t) => (t.id === msg.clipId ? applyClipStatus(t, msg) : t)));
+    }
+  });
 
   const unlockLoadMore = useCallback((delayMs = 0) => {
     if (loadMoreTimerRef.current) {
@@ -313,7 +226,7 @@ export default function PreviewDeck() {
     setLoadingMore(true);
     const nextPage = loadedPageRef.current + 1;
     try {
-      const page = await fetchTracksPage(nextPage);
+      const page = await loadPage(nextPage);
       if (!page) {
         unlockLoadMore(LOAD_MORE_ERROR_COOLDOWN_MS);
         return;
@@ -361,32 +274,7 @@ export default function PreviewDeck() {
     } catch {
       unlockLoadMore(LOAD_MORE_ERROR_COOLDOWN_MS);
     }
-  }, [unlockLoadMore]);
-
-  useEffect(() => {
-    let timer: ReturnType<typeof setInterval> | null = null;
-    const start = () => {
-      if (timer) return;
-      refresh();
-      timer = setInterval(refresh, POLL_MS);
-    };
-    const stop = () => {
-      if (timer) {
-        clearInterval(timer);
-        timer = null;
-      }
-    };
-    const onVisibility = () => {
-      if (document.hidden) stop();
-      else start();
-    };
-    onVisibility();
-    document.addEventListener('visibilitychange', onVisibility);
-    return () => {
-      document.removeEventListener('visibilitychange', onVisibility);
-      stop();
-    };
-  }, [refresh]);
+  }, [unlockLoadMore, loadPage]);
 
   useEffect(() => {
     return () => {
@@ -395,7 +283,7 @@ export default function PreviewDeck() {
   }, []);
 
   useEffect(() => {
-    if (!lastRefresh || !hasMore || loadingMore) return;
+    if (!lastPush || !hasMore || loadingMore) return;
     const el = sentinelRef.current;
     if (!el) return;
     const io = new IntersectionObserver(
@@ -406,38 +294,7 @@ export default function PreviewDeck() {
     );
     io.observe(el);
     return () => io.disconnect();
-  }, [lastRefresh, hasMore, loadingMore, loadMore, tracks.length]);
-
-  // 播放中音轨的捕获进度细粒度轮询（本机 preview 状态，不打 Suno）
-  useEffect(() => {
-    if (!currentId) return;
-    let timer: ReturnType<typeof setInterval> | null = null;
-    const tick = async () => {
-      const probe = await probePreview(currentId);
-      setTracks((prev) => prev.map((t) => (t.id === currentId ? applyProbe(t, probe) : t)));
-    };
-    const start = () => {
-      if (timer) return;
-      tick();
-      timer = setInterval(tick, STATUS_POLL_MS);
-    };
-    const stop = () => {
-      if (timer) {
-        clearInterval(timer);
-        timer = null;
-      }
-    };
-    const onVisibility = () => {
-      if (document.hidden) stop();
-      else start();
-    };
-    onVisibility();
-    document.addEventListener('visibilitychange', onVisibility);
-    return () => {
-      document.removeEventListener('visibilitychange', onVisibility);
-      stop();
-    };
-  }, [currentId]);
+  }, [lastPush, hasMore, loadingMore, loadMore, tracks.length]);
 
   // 自绘进度条数据源：原生控件对线性直播流不显示时长/进度
   useEffect(() => {
@@ -612,7 +469,13 @@ export default function PreviewDeck() {
             </p>
           </div>
           <div className="text-xs text-zinc-500">
-            {lastRefresh ? `上次刷新 ${lastRefresh.toLocaleTimeString()}` : '加载中…'}
+            {connection === 'connected'
+              ? lastPush
+                ? `实时 ${lastPush.toLocaleTimeString()}`
+                : '已连接'
+              : connection === 'reconnecting'
+                ? '重连中…'
+                : '连接中…'}
           </div>
         </header>
 
@@ -625,6 +488,8 @@ export default function PreviewDeck() {
               t.preview === 'capturing' ||
               t.preview === 'ready' ||
               t.preview === 'pending' ||
+              t.preview === 'waiting_clip' ||
+              t.preview === 'queued' ||
               t.preview === 'error';
             return (
               <li key={t.id}>
@@ -648,6 +513,9 @@ export default function PreviewDeck() {
                           : `捕获中 ${fmtTime(t.currentSec)} 已播放`)}
                       {t.preview === 'capturing' && ' · 可渐进试听'}
                       {t.preview === 'pending' && '点击后开始捕获并渐进试听'}
+                      {t.preview === 'waiting_clip' && '等待 clip 可试听'}
+                      {t.preview === 'queued' &&
+                        (t.queuePosition > 0 ? `排队第 ${t.queuePosition} 位` : '排队等待捕获')}
                       {t.preview === 'ready' && '可完整回放'}
                       {t.preview === 'error' && (t.error || '捕获失败')}
                       {t.preview === 'generating' && 'Suno 侧生成中，暂不可 preview'}
@@ -742,7 +610,7 @@ export default function PreviewDeck() {
           )}
         </div>
         <p className="mt-2 text-xs text-zinc-600">
-          音轨来源 /api/get 分页 · 滚到底部加载下一页 · 流式播放 /api/preview/{'{id}'}?stream=1 · 探测 /api/preview/{'{id}'}
+          实时通道 /mcp/preview/live · 滚到底部加载下一页 · 播放 /api/preview/{'{id}'}?stream=1
         </p>
       </div>
     </main>

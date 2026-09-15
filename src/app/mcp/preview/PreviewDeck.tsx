@@ -5,7 +5,11 @@ import { useMseAudio } from './useMseAudio';
 
 /**
  * Preview 试听台（协议层消费者）：
- * - 轮询 /api/get 第一时间发现新的可 preview 音轨（status = complete | streaming）
+ * - 轮询 /api/get?page=1 第一时间发现新的可 preview 音轨（status = complete | streaming）
+ * - 历史音轨按页增量加载：滚到列表底部再请求下一页，轮询只合并第一页、不丢已加载页
+ * - 翻页尽头只认空页，或连续两页/与第一页 id 集相同（page 参数被忽略）
+ * - 整页 duplicate 但与第一页不同 = feed 窗口滑动，继续翻；若曾翻到空页则视为补洞追上、停止
+ * - 第一页轮询出现从未见过的 id 且曾经以为翻完时，重开翻页（loadedPage 回到 1，下一拍拉 page=2）补中间页
  * - clip 一旦 complete/streaming，立即标 pending 并可点（不依赖探测）
  * - 对可 preview 音轨探测 /api/preview/{id}，细化三态：
  *     capturing → 正在串流的 preview（可渐进试听）
@@ -40,6 +44,8 @@ interface TrackView {
 
 const POLL_MS = 5000;
 const STATUS_POLL_MS = 3000;
+/** 下一页加载失败后的冷却，避免 sentinel 仍在视口内时对错误页空转。 */
+const LOAD_MORE_ERROR_COOLDOWN_MS = 2000;
 /** 自动探测条数上限。探测已缓存音轨会收到 200 二进制体再 cancel，不能对整页狂打。
  *  未探测到的 complete 音轨仍是 pending、可点，不依赖这个上限。 */
 const PROBE_TOP_N = 3;
@@ -67,10 +73,37 @@ function retainPreview(old: TrackView, status: string): PreviewState {
   return old.preview;
 }
 
-async function fetchRecentTracks(): Promise<TrackView[]> {
-  const res = await fetch('/api/get?page=1', { cache: 'no-store' });
-  if (!res.ok) return [];
-  const data: any[] = await res.json().catch(() => []);
+function mergeClip(old: TrackView | undefined, incoming: TrackView): TrackView {
+  if (!old) return incoming;
+  return {
+    ...old,
+    title: incoming.title,
+    status: incoming.status,
+    createdAt: incoming.createdAt ?? old.createdAt,
+    durationSec: incoming.durationSec || old.durationSec,
+    preview: retainPreview(old, incoming.status)
+  };
+}
+
+/** 第一页是最新窗口：放在列表头；已加载的更旧页接到后面，避免轮询冲掉翻页结果。 */
+function mergePage1(prev: TrackView[], fresh: TrackView[]): TrackView[] {
+  const prevById = new Map(prev.map((t) => [t.id, t]));
+  const freshIds = new Set(fresh.map((t) => t.id));
+  const head = fresh.map((t) => mergeClip(prevById.get(t.id), t));
+  const tail = prev.filter((t) => !freshIds.has(t.id));
+  return [...head, ...tail];
+}
+
+function sameIdSet(ids: string[], set: Set<string>): boolean {
+  if (ids.length !== set.size) return false;
+  return ids.every((id) => set.has(id));
+}
+
+async function fetchTracksPage(page: number): Promise<TrackView[] | null> {
+  const res = await fetch(`/api/get?page=${page}`, { cache: 'no-store' });
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  if (!Array.isArray(data)) return null;
   return data.map((c: any) => {
     const status = String(c.status || '');
     return {
@@ -179,12 +212,24 @@ export default function PreviewDeck() {
   const [bufferedSec, setBufferedSec] = useState(0);
   const [mediaDurationSec, setMediaDurationSec] = useState(0);
   const [volume, setVolume] = useState(1);
+  const [hasMore, setHasMore] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const barRef = useRef<HTMLDivElement | null>(null);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
   const currentIdRef = useRef<string | null>(null);
   currentIdRef.current = currentId;
   const tracksRef = useRef<TrackView[]>([]);
   tracksRef.current = tracks;
+  const loadedPageRef = useRef(1);
+  const hasMoreRef = useRef(true);
+  const loadingMoreRef = useRef(false);
+  const bootstrappedRef = useRef(false);
+  const loadMoreTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const page1IdsRef = useRef<Set<string>>(new Set());
+  const lastLoadedPageIdsRef = useRef<Set<string>>(new Set());
+  /** 曾经拿到过空页，列表在当时已覆盖到 feed 尽头；之后的整页 duplicate 视为补洞追上。 */
+  const reachedEndRef = useRef(false);
 
   const currentTrack = tracks.find((t) => t.id === currentId) ?? null;
   // 串流是线性直播流，浏览器读不到 duration；优先用曲目元数据里的已知时长
@@ -194,24 +239,32 @@ export default function PreviewDeck() {
 
   const refresh = useCallback(async () => {
     try {
-      const fresh = await fetchRecentTracks();
-      setTracks((prev) => {
-        const prevById = new Map(prev.map((t) => [t.id, t]));
-        return fresh.map((t) => {
-          const old = prevById.get(t.id);
-          if (!old) return t;
-          // 刷新曲目元数据；Suno 侧完成后从 generating 升为 pending。
-          // capturing/ready/pending/error 由探测覆盖，这里只避免 stale generating。
-          return {
-            ...old,
-            title: t.title,
-            status: t.status,
-            createdAt: t.createdAt ?? old.createdAt,
-            durationSec: t.durationSec || old.durationSec,
-            preview: retainPreview(old, t.status)
-          };
-        });
-      });
+      const fresh = await fetchTracksPage(1);
+      if (!fresh) return;
+      page1IdsRef.current = new Set(fresh.map((t) => t.id));
+      const prevIds = new Set(tracksRef.current.map((t) => t.id));
+      const hasUnseen = fresh.some((t) => !prevIds.has(t.id));
+      if (fresh.length === 0 && loadedPageRef.current === 1 && prevIds.size === 0) {
+        hasMoreRef.current = false;
+        setHasMore(false);
+        reachedEndRef.current = true;
+      } else if (
+        hasUnseen &&
+        (reachedEndRef.current || !hasMoreRef.current) &&
+        !loadingMoreRef.current
+      ) {
+        // 第一页冒出从未见过的 id，且曾经以为翻完：从 page=2 补中间被滑走的页
+        loadedPageRef.current = 1;
+        lastLoadedPageIdsRef.current = new Set(fresh.map((t) => t.id));
+        hasMoreRef.current = true;
+        setHasMore(true);
+      } else if (loadedPageRef.current === 1 && !reachedEndRef.current) {
+        const more = fresh.length > 0;
+        hasMoreRef.current = more;
+        setHasMore(more);
+      }
+      setTracks((prev) => mergePage1(prev, fresh));
+      bootstrappedRef.current = true;
       setLastRefresh(new Date());
 
       // 只读探测最新几条，细化 pending/capturing/ready 徽章（不会触发捕获）。
@@ -237,6 +290,79 @@ export default function PreviewDeck() {
     }
   }, []);
 
+  const unlockLoadMore = useCallback((delayMs = 0) => {
+    if (loadMoreTimerRef.current) {
+      clearTimeout(loadMoreTimerRef.current);
+      loadMoreTimerRef.current = null;
+    }
+    const apply = () => {
+      loadMoreTimerRef.current = null;
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    };
+    if (delayMs <= 0) {
+      apply();
+      return;
+    }
+    loadMoreTimerRef.current = setTimeout(apply, delayMs);
+  }, []);
+
+  const loadMore = useCallback(async () => {
+    if (!bootstrappedRef.current || loadingMoreRef.current || !hasMoreRef.current) return;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    const nextPage = loadedPageRef.current + 1;
+    try {
+      const page = await fetchTracksPage(nextPage);
+      if (!page) {
+        unlockLoadMore(LOAD_MORE_ERROR_COOLDOWN_MS);
+        return;
+      }
+      loadedPageRef.current = nextPage;
+      if (page.length === 0) {
+        reachedEndRef.current = true;
+        hasMoreRef.current = false;
+        setHasMore(false);
+        unlockLoadMore();
+        return;
+      }
+      const pageIds = page.map((t) => t.id);
+      const sameAsPage1 = sameIdSet(pageIds, page1IdsRef.current);
+      const sameAsLast = sameIdSet(pageIds, lastLoadedPageIdsRef.current);
+      lastLoadedPageIdsRef.current = new Set(pageIds);
+      const seen = new Set(tracksRef.current.map((t) => t.id));
+      const unique = page.filter((t) => !seen.has(t.id));
+      setTracks((prev) => {
+        const seenNow = new Set(prev.map((t) => t.id));
+        const next = page.filter((t) => !seenNow.has(t.id));
+        return next.length ? [...prev, ...next] : prev;
+      });
+      if (sameAsPage1 || sameAsLast) {
+        // page 参数被忽略，或服务端把末页原样重复返回
+        if (sameAsLast && !sameAsPage1) reachedEndRef.current = true;
+        hasMoreRef.current = false;
+        setHasMore(false);
+        unlockLoadMore();
+        return;
+      }
+      if (unique.length > 0) {
+        hasMoreRef.current = true;
+        setHasMore(true);
+      } else if (reachedEndRef.current) {
+        // 曾翻到空页：整页都是已有 id，说明补洞已追上旧列表
+        hasMoreRef.current = false;
+        setHasMore(false);
+      } else {
+        // feed 窗口滑动：本页是 tail 里的旧第一页，后面可能还有更旧页
+        hasMoreRef.current = true;
+        setHasMore(true);
+      }
+      unlockLoadMore();
+    } catch {
+      unlockLoadMore(LOAD_MORE_ERROR_COOLDOWN_MS);
+    }
+  }, [unlockLoadMore]);
+
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | null = null;
     const start = () => {
@@ -261,6 +387,26 @@ export default function PreviewDeck() {
       stop();
     };
   }, [refresh]);
+
+  useEffect(() => {
+    return () => {
+      if (loadMoreTimerRef.current) clearTimeout(loadMoreTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!lastRefresh || !hasMore || loadingMore) return;
+    const el = sentinelRef.current;
+    if (!el) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMore();
+      },
+      { root: null, rootMargin: '0px 0px 120px 0px' }
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [lastRefresh, hasMore, loadingMore, loadMore, tracks.length]);
 
   // 播放中音轨的捕获进度细粒度轮询（本机 preview 状态，不打 Suno）
   useEffect(() => {
@@ -462,7 +608,7 @@ export default function PreviewDeck() {
           <div>
             <h1 className="text-2xl font-bold">Suno Preview 试听台</h1>
             <p className="mt-1 text-sm text-zinc-400">
-              实时发现可 preview 的音轨 · 点击即渐进试听（无需 unlock）
+              实时发现可 preview 的音轨 · 点击即渐进试听 · 滚到底部加载全部
             </p>
           </div>
           <div className="text-xs text-zinc-500">
@@ -517,6 +663,25 @@ export default function PreviewDeck() {
           {tracks.length === 0 && (
             <li className="rounded-lg border border-dashed border-zinc-800 p-6 text-center text-sm text-zinc-500">
               暂无音轨。生成音乐后此处会自动出现可 preview 的条目。
+            </li>
+          )}
+          {tracks.length > 0 && (
+            <li>
+              <div ref={sentinelRef} className="py-3 text-center text-xs text-zinc-500">
+                {loadingMore ? (
+                  '正在加载更多音轨…'
+                ) : hasMore ? (
+                  <button
+                    type="button"
+                    onClick={() => loadMore()}
+                    className="text-zinc-500 hover:text-zinc-300"
+                  >
+                    滚到底部加载更多
+                  </button>
+                ) : (
+                  '已加载全部音轨'
+                )}
+              </div>
             </li>
           )}
         </ul>
@@ -577,7 +742,7 @@ export default function PreviewDeck() {
           )}
         </div>
         <p className="mt-2 text-xs text-zinc-600">
-          音轨来源 /api/get?page=1 · 流式播放 /api/preview/{'{id}'}?stream=1 · 探测 /api/preview/{'{id}'}
+          音轨来源 /api/get 分页 · 滚到底部加载下一页 · 流式播放 /api/preview/{'{id}'}?stream=1 · 探测 /api/preview/{'{id}'}
         </p>
       </div>
     </main>

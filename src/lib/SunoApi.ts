@@ -4,6 +4,7 @@ import pino from 'pino';
 import yn from 'yn';
 import { isPage, sleep, waitForRequests } from '@/lib/utils';
 import { CaptchaGate, ClientGoneError } from '@/lib/captcha-gate';
+import { PAGE_FETCH_DEFAULT_TIMEOUT_MS, SunoBrowserSession } from '@/lib/suno-browser-session';
 import * as cookie from 'cookie';
 import { randomUUID } from 'node:crypto';
 import { Solver } from '@2captcha/captcha-solver';
@@ -438,6 +439,9 @@ class SunoApi {
   private cookies: Record<string, string | undefined>;
   private solver = new Solver(process.env.TWOCAPTCHA_KEY + '');
   private captchaGate = new CaptchaGate();
+  private browserSession: SunoBrowserSession;
+  private generatePageInflight?: Promise<Page>;
+  private captchaRouteEpoch = 0;
   private ghostCursorEnabled = yn(process.env.BROWSER_GHOST_CURSOR, { default: false });
   private cursor?: Cursor;
   private feedListCache?: { key: string; at: number; data: AudioInfo[] };
@@ -483,13 +487,23 @@ class SunoApi {
     this.client.interceptors.response.use(resp => {
       const setCookieHeader = resp.headers['set-cookie'];
       if (Array.isArray(setCookieHeader)) {
-        const newCookies = cookie.parse(setCookieHeader.join('; '));
-        for (const [key, value] of Object.entries(newCookies)) {
-          this.cookies[key] = value;
+        for (const header of setCookieHeader) {
+          const pair = String(header).split(';')[0];
+          if (!pair)
+            continue;
+          const parsed = cookie.parse(pair);
+          for (const [key, value] of Object.entries(parsed)) {
+            if (value !== undefined)
+              this.cookies[key] = value;
+          }
         }
       }
       return resp;
-    })
+    });
+    this.browserSession = new SunoBrowserSession({
+      launch: () => this.launchBrowser(),
+      dispose: (browser, context) => this.disposeBrowser(browser, context)
+    });
   }
 
   public async init(): Promise<SunoApi> {
@@ -587,12 +601,143 @@ class SunoApi {
     return tokenResponse.data.session_id;
   }
 
-  private async captchaRequired(): Promise<boolean> {
-    const resp = await this.client.post(`${SunoApi.BASE_URL}/api/c/check`, {
-      ctype: 'generation'
+  private async captchaRequired(signal?: AbortSignal): Promise<boolean> {
+    try {
+      return await this.captchaCheckOnce(signal);
+    } catch (err: any) {
+      if (signal?.aborted || err instanceof ClientGoneError)
+        throw new ClientGoneError();
+      logger.warn('CAPTCHA check via Chromium session failed: ' + err.message);
+      if (!this.browserSession.isAlive())
+        await this.browserSession.invalidate();
+      return await this.captchaCheckOnce(signal);
+    }
+  }
+
+  private async captchaCheckOnce(signal?: AbortSignal): Promise<boolean> {
+    await this.ensureGeneratePage(signal);
+    const resp = await this.browserSession.withRead(async () => {
+      return this.browserSession.pageFetch(`${SunoApi.BASE_URL}/api/c/check`, {
+        method: 'POST',
+        headers: await this.browserGenerateHeaders(true),
+        body: JSON.stringify({ ctype: 'generation' }),
+        timeoutMs: PAGE_FETCH_DEFAULT_TIMEOUT_MS,
+        signal,
+        locked: true
+      });
     });
-    logger.info(resp.data);
-    return resp.data.required;
+    logger.info(resp.json ?? { status: resp.status, snippet: resp.text.slice(0, 200) });
+    if (!resp.ok)
+      throw new Error('captcha check HTTP ' + resp.status);
+    if (!resp.json || typeof resp.json.required !== 'boolean')
+      throw new Error('captcha check returned no required field');
+    return resp.json.required;
+  }
+
+  private async browserGenerateHeaders(locked = false): Promise<Record<string, string>> {
+    const token = await this.browserSession.getClerkToken(locked);
+    if (token)
+      this.currentToken = token;
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'x-suno-client': 'suno-web'
+    };
+    if (token)
+      headers.Authorization = `Bearer ${token}`;
+    return headers;
+  }
+
+  private async syncAuthFromBrowser(): Promise<void> {
+    const token = await this.browserSession.getClerkToken().catch(() => undefined);
+    if (token)
+      this.currentToken = token;
+    const cookies = await this.browserSession.readCookies().catch(() => []);
+    for (const item of cookies) {
+      if (item.name && item.value)
+        this.cookies[item.name] = item.value;
+    }
+  }
+
+  private async ensureGeneratePage(signal?: AbortSignal): Promise<Page> {
+    if (signal?.aborted)
+      throw new ClientGoneError();
+    if (!this.generatePageInflight)
+      this.generatePageInflight = this.ensureGeneratePageUnqueued();
+    const run = this.generatePageInflight;
+    try {
+      const page = await run;
+      if (signal?.aborted)
+        throw new ClientGoneError();
+      return page;
+    } finally {
+      if (this.generatePageInflight === run)
+        this.generatePageInflight = undefined;
+    }
+  }
+
+  private async ensureGeneratePageUnqueued(): Promise<Page> {
+    const { page, reused, newBrowser } = await this.browserSession.ensurePage(async (next) => {
+      await this.installTurnstileHook(next);
+    });
+    if (newBrowser)
+      logger.info('Launching browser... (new session)');
+    else if (!reused)
+      logger.info('Chromium session: new page on existing browser');
+    else
+      logger.info('Reusing Chromium session');
+
+    if (this.ghostCursorEnabled && !reused)
+      this.cursor = await createCursor(page);
+
+    await this.browserSession.withWrite(async () => {
+      if (reused)
+        await this.ensureOnCreatePage(page, false);
+      else
+        await this.warmCreatePage(page);
+    });
+    return page;
+  }
+
+  private async warmCreatePage(page: Page): Promise<void> {
+    await page.goto('https://suno.com/create', {
+      referer: 'https://www.google.com/',
+      waitUntil: 'domcontentloaded',
+      timeout: 60000
+    });
+    logger.info('Waiting for Suno interface to load');
+    try {
+      await page.waitForResponse('**/api/billing/usage-plan-descriptions/**', { timeout: 30000 });
+    } catch {
+      // some accounts never hit this endpoint
+    }
+    await page.getByRole('link', { name: 'Home' }).waitFor({ timeout: 30000 });
+    await page.locator('textarea').first().waitFor({ state: 'visible', timeout: 15000 });
+    await sleep(1, 1);
+    await this.dismissOverlays(page);
+  }
+
+  private async ensureOnCreatePage(page: Page, resetWidget = false): Promise<void> {
+    if (page.isClosed())
+      throw new Error('Chromium session page is closed');
+    const widgetUp = resetWidget
+      && ((await this.isTurnstileVisible(page)) || (await this.isHcaptchaVisible(page)));
+    const onCreate = /suno\.com\/create/.test(page.url());
+    if (!onCreate || widgetUp) {
+      logger.info('Resetting Chromium session to /create');
+      await this.warmCreatePage(page);
+      return;
+    }
+    await this.dismissOverlays(page);
+    const visible = await page.locator('textarea').first().isVisible().catch(() => false);
+    if (!visible)
+      await this.warmCreatePage(page);
+  }
+
+  private async isHcaptchaVisible(page: Page): Promise<boolean> {
+    const iframe = page.locator('iframe[title*="hCaptcha"]');
+    if (await iframe.count() === 0)
+      return false;
+    return iframe.first().isVisible().catch(() => false);
   }
 
   /**
@@ -696,9 +841,11 @@ class SunoApi {
    * Suno currently serves Cloudflare Turnstile (captcha_version 2) and may
    * still fall back to hCaptcha (version 1).
    *
+   * Check and solve both run on the long-lived Chromium session page.
    * When `submitOptions` is provided, the intercepted browser generate is
-   * rewritten to the real payload and sent from Chromium (same TLS/JWT as
-   * the widget). Axios must not replay that one-time token afterwards.
+   * rewritten to the real payload and sent from that same page (same TLS/JWT
+   * as the widget). Axios must not replay that one-time token afterwards.
+   * The Chromium process is kept alive after the solve.
    * @returns {string|null} Captcha token. If no verification is required, returns null
    */
   public async getCaptcha(
@@ -710,43 +857,25 @@ class SunoApi {
     this.captchaTransactionUuid = undefined;
     this.captchaBrowserClips = undefined;
     this.captchaBrowserError = undefined;
-    if (!await this.captchaRequired())
+    if (!await this.captchaRequired(signal))
       return null;
 
     // Becoming the solver engages the per-account soft lock so concurrent
     // requests queue up instead of each launching their own browser + 2Captcha solve.
     engage();
-    logger.info('CAPTCHA required. Launching browser...');
-    const { browser, context } = await this.launchBrowser();
+    logger.info('CAPTCHA required. Using Chromium session...');
+    const page = await this.ensureGeneratePage(signal);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 300000);
     const onExternalAbort = () => controller.abort();
     if (signal)
       signal.addEventListener('abort', onExternalAbort, { once: true });
-    let page!: Page;
     let routeHandler: ((route: any) => Promise<void>) | null = null;
     const generateRoute = /\/api\/generate\/v2/;
+    const routeEpoch = ++this.captchaRouteEpoch;
 
     try {
-      page = await context.newPage();
-      await this.installTurnstileHook(page);
-      await page.goto('https://suno.com/', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 60000 });
-
-      logger.info('Waiting for Suno interface to load');
-      // New Suno UI no longer calls /api/project/; wait for a known API and a short render delay
-      try {
-        await page.waitForResponse('**/api/billing/usage-plan-descriptions/**', { timeout: 30000 });
-      } catch {
-        // Fallback: some regions/users may not hit this endpoint; continue after delay
-      }
-      // Skeleton textarea is visible before hydration; wait for the logged-in shell.
-      await page.getByRole('link', { name: 'Home' }).waitFor({ timeout: 30000 });
-      await page.locator('textarea').first().waitFor({ state: 'visible', timeout: 15000 });
-      await sleep(1, 1);
-
-      if (this.ghostCursorEnabled)
-        this.cursor = await createCursor(page);
-
+      return await this.browserSession.withWrite(async () => {
       logger.info('Triggering the CAPTCHA');
       await this.dismissOverlays(page);
 
@@ -754,13 +883,9 @@ class SunoApi {
       await this.click(textarea);
       await textarea.fill('Lorem ipsum');
 
-      const button = page.locator('button:has-text("Create")').first();
-      await page.waitForFunction(() => {
-        const btn = [...document.querySelectorAll('button')].find((el) =>
-          (el.textContent || '').replace(/\s+/g, ' ').trim() === 'Create'
-        ) as HTMLButtonElement | undefined;
-        return !!btn && !btn.disabled && !btn.hasAttribute('data-disabled');
-      }, { timeout: 20000 });
+      const createSong = page.locator('button[aria-label="Create song"]');
+      const homepageCreate = page.locator('button:has-text("Create")').first();
+      const button = (await createSong.count()) > 0 ? createSong.first() : homepageCreate;
 
       let tokenSettled = false;
       const tokenPromise = new Promise<string>((resolve, reject) => {
@@ -773,6 +898,10 @@ class SunoApi {
         };
         controller.signal.addEventListener('abort', onAbort, { once: true });
         routeHandler = async (route: any) => {
+          if (routeEpoch !== this.captchaRouteEpoch) {
+            await route.continue();
+            return;
+          }
           if (tokenSettled) {
             route.abort();
             return;
@@ -869,18 +998,14 @@ class SunoApi {
         page.route(generateRoute, routeHandler);
       });
 
-      await this.click(button);
-
-      // New Suno UI navigates to /create after clicking Create
-      logger.info('Waiting for navigation to /create');
-      try {
-        await page.waitForFunction(() => location.pathname.includes('/create'), { timeout: 30000 });
-        logger.info('Navigated to /create');
-      } catch {
-        logger.warn('Did not navigate to /create, url=' + page.url());
-      }
-      await this.dismissOverlays(page);
       await this.triggerCreateOnCreatePage(page);
+      if (!(await this.isTurnstileVisible(page)) && !(await this.isHcaptchaVisible(page))) {
+        const homepageCreateVisible = await homepageCreate.isVisible().catch(() => false);
+        if (homepageCreateVisible && await homepageCreate.isEnabled().catch(() => false)) {
+          logger.info('Clicking homepage Create as fallback');
+          await this.click(homepageCreate);
+        }
+      }
 
       const captchaPromise = this.solveDetectedCaptcha(page, button, controller.signal)
         .then(() => ({ type: 'solved' as const }))
@@ -904,22 +1029,37 @@ class SunoApi {
       if (!tokenSettled)
         await this.triggerCreateOnCreatePage(page);
       return await tokenPromise;
+      });
+    } catch (err) {
+      if (!this.browserSession.isAlive()) {
+        logger.warn('CAPTCHA failed and Chromium session is dead; invalidating');
+        await this.browserSession.invalidate().catch(() => {});
+      } else {
+        logger.warn(
+          'CAPTCHA session solve failed; keeping Chromium session: ' + (err as Error).message
+        );
+      }
+      throw err;
     } finally {
+      this.captchaRouteEpoch++;
       clearTimeout(timeoutId);
       controller.abort();
       if (signal)
         signal.removeEventListener('abort', onExternalAbort);
       try {
-        if (page && routeHandler) {
+        if (!page.isClosed() && routeHandler) {
           await Promise.race([
             page.unroute(generateRoute, routeHandler),
-            waitMs(5000).then(() => logger.info('page.unroute timed out; continuing teardown'))
+            waitMs(5000).then(() => logger.info('page.unroute timed out; session kept alive'))
           ]);
         }
       } catch {
-        // never block teardown on unroute
+        // never block on unroute; stale handlers no-op via captchaRouteEpoch
       }
-      await this.disposeBrowser(browser, context);
+      if (this.browserSession.isAlive())
+        await this.browserSession.withWrite(() => this.ensureOnCreatePage(page, true)).catch((e: any) => {
+          logger.info('Post-captcha /create reset failed: ' + e.message);
+        });
     }
   }
 
@@ -1351,7 +1491,6 @@ class SunoApi {
     signal?: AbortSignal,
     extras?: GenerationExtras
   ): Promise<AudioInfo[]> {
-    await this.keepAlive(false);
     const startTime = Date.now();
     const audios = await this.generateSongs({
       prompt,
@@ -1441,28 +1580,25 @@ class SunoApi {
    * @returns A promise that resolves to an array of AudioInfo objects representing the generated songs.
    */
   private async generateSongs(options: GenerateSongsOptions): Promise<AudioInfo[]> {
-    // The gated section is kept short on purpose: keepAlive + captcha
-    // acquisition + the generate POST. The wait_audio polling runs outside the
+    // The gated section is kept short on purpose: Chromium-session captcha
+    // check/solve + the generate POST. The wait_audio polling runs outside the
     // gate so queued requests are only blocked by the solver's submission, not
     // by its audio rendering.
     const clips = await this.captchaGate.run(async (engage) => {
       try {
-        await this.keepAlive();
         const captchaToken = await this.getCaptcha(engage, options.signal, options);
         if (this.captchaBrowserClips) {
           this.invalidateFeedListCache();
+          await this.syncAuthFromBrowser();
           return this.captchaBrowserClips;
         }
         if (this.captchaBrowserError)
           throw new Error(this.captchaBrowserError);
-        // Captcha tokens are bound to the browser JWT that minted them.
-        // Only renew if that JWT is actually about to expire.
-        if (captchaToken) {
-          const remaining = jwtRemainingMs(this.currentToken);
-          if (remaining !== undefined && remaining < KEEPALIVE_RENEW_SKEW_MS)
-            await this.keepAlive(true);
-        }
-        return await this.postGenerate({ ...options, captchaToken });
+        if (captchaToken)
+          throw new Error('Captcha token captured but browser generate did not complete');
+        const created = await this.postGenerateViaPage({ ...options, captchaToken: null });
+        await this.syncAuthFromBrowser();
+        return created;
       } catch (e) {
         // A disconnected client must not fail the queued backlog: map any
         // in-flight failure to ClientGoneError so the gate treats it neutrally.
@@ -1512,9 +1648,14 @@ class SunoApi {
     }));
   }
 
-  private async postGenerate(
+  /**
+   * Submit generate from the long-lived Chromium page (same TLS as /api/c/check).
+   * Do not call axios postGenerate for this — Node TLS is a different client.
+   */
+  private async postGenerateViaPage(
     options: GenerateSongsOptions & { captchaToken: string | null }
   ): Promise<any[]> {
+    await this.ensureGeneratePage(options.signal);
     const payload = buildGenerateV2Payload(options, {
       captchaToken: options.captchaToken,
       captchaTokenProvider: this.captchaTokenProvider,
@@ -1539,23 +1680,28 @@ class SunoApi {
           2
         )
     );
-    const response = await this.client.post(
-      `${SunoApi.BASE_URL}/api/generate/v2-web/`,
-      payload,
-      {
-        timeout: 10000, // 10 seconds timeout
-        headers: options.captchaToken ? {
-          'x-suno-client': 'suno-web',
-          Origin: 'https://suno.com',
-          Referer: 'https://suno.com/create'
-        } : undefined
-      }
-    );
-    if (response.status !== 200) {
-      throw new Error('Error response:' + response.statusText);
+    const result = await this.browserSession.withRead(async () => {
+      return this.browserSession.pageFetch(
+        `${SunoApi.BASE_URL}/api/generate/v2-web/`,
+        {
+          method: 'POST',
+          headers: await this.browserGenerateHeaders(true),
+          body: JSON.stringify(payload),
+          timeoutMs: 20000,
+          signal: options.signal,
+          locked: true
+        }
+      );
+    });
+    if (result.status !== 200) {
+      const snippet = (result.text || '').replace(/\s+/g, ' ').slice(0, 240);
+      throw new Error('Error response:' + result.status + (snippet ? ' ' + snippet : ''));
     }
+    const clips = result.json?.clips;
+    if (!Array.isArray(clips) || clips.length === 0)
+      throw new Error('Browser generate produced no clips');
     this.invalidateFeedListCache();
-    return response.data.clips;
+    return clips;
   }
 
   /**

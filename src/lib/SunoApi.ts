@@ -1,7 +1,7 @@
 import axios, { AxiosInstance } from 'axios';
 import pino from 'pino';
 import yn from 'yn';
-import { isPage, sleep, waitForRequests } from '@/lib/utils';
+import { isClosedCdpError, isPage, sleep, waitForRequests } from '@/lib/utils';
 import { CaptchaGate, ClientGoneError } from '@/lib/captcha-gate';
 import { PAGE_FETCH_DEFAULT_TIMEOUT_MS, SunoBrowserSession } from '@/lib/suno-browser-session';
 import {
@@ -51,6 +51,12 @@ const PREVIEW_RESULT_TTL_MS = 10 * 60 * 1000;
 const KEEPALIVE_RENEW_SKEW_MS = 15 * 1000;
 /** Feed listing (`get()` without ids): short TTL coalesces HTTP / MCP callers. The preview-live watch uses `{ fresh: true }`. */
 const FEED_LIST_TTL_MS = 10 * 1000;
+/** After the widget passes, wait this long for Suno to auto-submit generate/v2. */
+const POST_CAPTCHA_AUTOSUBMIT_MS = 2500;
+/** After a post-pass Create click, wait this long for /api/generate/v2 to hit the intercept. */
+const POST_CAPTCHA_GENERATE_WAIT_MS = 8000;
+export const CAPTCHA_GENERATE_NOT_SUBMITTED =
+  'Captcha passed but generate/v2 was not submitted';
 
 export type PreviewJobPhase = 'waiting_clip' | 'queued' | 'capturing' | 'error';
 
@@ -772,11 +778,78 @@ class SunoApi {
       await this.warmCreatePage(page);
   }
 
+  /** Checkbox widget is ~300x75; the challenge overlay is much taller. Measured on the parent iframe element — never enter the child frame. */
+  private static readonly HCAPTCHA_CHALLENGE_MIN_WIDTH = 200;
+  private static readonly HCAPTCHA_CHALLENGE_MIN_HEIGHT = 150;
+
+  private hcaptchaWidgetIframes(page: Page): Locator {
+    return page.mainFrame().locator('iframe[title*="hCaptcha"]');
+  }
+
   private async isHcaptchaVisible(page: Page): Promise<boolean> {
-    const iframe = page.locator('iframe[title*="hCaptcha"]');
-    if (await iframe.count() === 0)
+    if (page.isClosed())
       return false;
-    return iframe.first().isVisible().catch(() => false);
+    try {
+      const iframe = this.hcaptchaWidgetIframes(page);
+      if (await iframe.count() === 0)
+        return false;
+      return iframe.first().isVisible().catch(() => false);
+    } catch (err) {
+      if (isClosedCdpError(err))
+        return false;
+      throw err;
+    }
+  }
+
+  /**
+   * Whether the challenge overlay iframe is still in the main document.
+   * boundingBox is on the parent <iframe> node — does not createIsolatedWorld
+   * inside the hCaptcha frame (which rebrowser logs and swallows on teardown).
+   */
+  private async isHcaptchaChallengeOpen(page: Page): Promise<boolean> {
+    if (page.isClosed())
+      return false;
+    try {
+      const iframes = this.hcaptchaWidgetIframes(page);
+      const n = await iframes.count();
+      for (let i = 0; i < n; i++) {
+        const box = await iframes.nth(i).boundingBox().catch(() => null);
+        if (
+          box
+          && box.width >= SunoApi.HCAPTCHA_CHALLENGE_MIN_WIDTH
+          && box.height >= SunoApi.HCAPTCHA_CHALLENGE_MIN_HEIGHT
+        )
+          return true;
+      }
+      return false;
+    } catch (err) {
+      if (isClosedCdpError(err))
+        return false;
+      throw err;
+    }
+  }
+
+  private async waitForHcaptchaChallengeOpen(
+    page: Page,
+    signal: AbortSignal,
+    timeoutMs: number
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (signal.aborted)
+        throw new Error('AbortError');
+      if (this.captchaTokenCaptured())
+        return false;
+      if (await this.isHcaptchaChallengeOpen(page))
+        return true;
+      await waitMs(200);
+    }
+    return this.captchaTokenCaptured() ? false : await this.isHcaptchaChallengeOpen(page);
+  }
+
+  /** Create song is on the Suno page, never inside hCaptcha/Turnstile iframes. */
+  private createSongButton(page: Page): Locator {
+    return page.mainFrame().locator('button[aria-label="Create song"]');
   }
 
   /**
@@ -898,6 +971,11 @@ class SunoApi {
 
   private captchaTokenCaptured(): boolean {
     return !!this.activeCaptchaSolve?.tokenSettled;
+  }
+
+  /** Intercept actually saw a captcha token on generate/v2. tokenSettled is also set on abort. */
+  private hasCapturedGenerateToken(): boolean {
+    return !!this.activeCaptchaSolve?.capturedToken;
   }
 
   private shouldRecycleBrowserSession(): boolean {
@@ -1061,12 +1139,12 @@ class SunoApi {
       await this.dismissOverlays(page);
       await this.ensureGenerateRoute(page);
 
-      const textarea = page.locator('textarea').first();
+      const textarea = page.mainFrame().locator('textarea').first();
       await this.click(textarea);
       await textarea.fill('Lorem ipsum');
 
-      const createSong = page.locator('button[aria-label="Create song"]');
-      const homepageCreate = page.locator('button:has-text("Create")').first();
+      const createSong = this.createSongButton(page);
+      const homepageCreate = page.mainFrame().locator('button:has-text("Create")').first();
       const button = (await createSong.count()) > 0 ? createSong.first() : homepageCreate;
 
       const tokenPromise = new Promise<string>((resolve, reject) => {
@@ -1098,33 +1176,46 @@ class SunoApi {
       const captchaPromise = this.solveDetectedCaptcha(page, button, controller.signal)
         .then(() => ({ type: 'solved' as const }))
         .catch((err: any) => ({ type: 'solver_failed' as const, err }));
+      // Consume tokenPromise rejection so abort during the post-pass wait
+      // cannot surface as unhandled Captcha timeout.
+      const tokenWin = tokenPromise.then(
+        (token) => ({ type: 'token' as const, token }),
+        (err: any) => ({ type: 'token_rejected' as const, err })
+      );
       const raced = await Promise.race([
-        tokenPromise.then((token) => ({ type: 'token' as const, token })),
+        tokenWin,
         captchaPromise,
       ]);
       if (raced.type === 'token')
         return raced.token;
+      if (raced.type === 'token_rejected')
+        throw raced.err;
       if (raced.type === 'solver_failed') {
         // Grace window: managed Turnstile can pass silently right as the kind-poll expires
-        const lateToken = await Promise.race([
-          tokenPromise,
-          waitMs(5000).then(() => null)
-        ]).catch(() => null);
-        if (lateToken)
-          return lateToken;
+        const late = await Promise.race([
+          tokenWin,
+          waitMs(5000).then(() => ({ type: 'late_none' as const }))
+        ]);
+        if (late.type === 'token')
+          return late.token;
+        if (late.type === 'token_rejected')
+          throw late.err;
         throw new Error('CAPTCHA solver failed: ' + (raced.err?.message || 'unknown'));
       }
-      if (!this.captchaTokenCaptured())
-        await this.triggerCreateOnCreatePage(page);
+      await this.submitGenerateAfterCaptchaPass(page, controller.signal);
       return await tokenPromise;
       });
     } catch (err) {
-      if (!this.browserSession.isAlive()) {
-        logger.warn('CAPTCHA failed and Chromium session is dead; invalidating');
+      const message = (err as Error).message || '';
+      const wedged =
+        !this.browserSession.isAlive()
+        || message === CAPTCHA_GENERATE_NOT_SUBMITTED;
+      if (wedged) {
+        logger.warn('CAPTCHA failed; invalidating Chromium session: ' + message);
         await this.browserSession.invalidate().catch(() => {});
       } else {
         logger.warn(
-          'CAPTCHA session solve failed; keeping Chromium session: ' + (err as Error).message
+          'CAPTCHA session solve failed; keeping Chromium session: ' + message
         );
       }
       throw err;
@@ -1231,38 +1322,153 @@ class SunoApi {
     });
   }
 
+  private async isTurnstileVisible(page: Page): Promise<boolean> {
+    if (page.isClosed())
+      return false;
+    try {
+      for (const frame of page.frames()) {
+        if (frame.isDetached() || !/challenges\.cloudflare\.com/i.test(frame.url()))
+          continue;
+        try {
+          const box = await (await frame.frameElement()).boundingBox();
+          if (box && box.width > 40 && box.height > 40)
+            return true;
+        } catch {}
+      }
+      return page.mainFrame().getByText('Verify you are human').isVisible().catch(() => false);
+    } catch (err) {
+      if (isClosedCdpError(err))
+        return false;
+      throw err;
+    }
+  }
+
+  /**
+   * After the widget passes, Suno often auto-submits generate/v2 while the
+   * hCaptcha iframe is tearing down. Wait for the intercept or for the iframe
+   * to leave before clicking Create again.
+   */
+  private async waitForGenerateTokenOrWidgetGone(
+    page: Page,
+    signal: AbortSignal,
+    timeoutMs: number
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (signal.aborted || page.isClosed() || this.hasCapturedGenerateToken())
+        return;
+      if (!(await this.isHcaptchaVisible(page)))
+        return;
+      await waitMs(200);
+    }
+  }
+
+  private async waitUntilGenerateCaptured(
+    page: Page,
+    signal: AbortSignal,
+    timeoutMs: number
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (signal.aborted)
+        throw new Error('AbortError');
+      if (this.hasCapturedGenerateToken())
+        return true;
+      if (page.isClosed())
+        return false;
+      await waitMs(200);
+    }
+    return this.hasCapturedGenerateToken();
+  }
+
+  /**
+   * Widget passed but generate/v2 may not have fired. Confirm intercept saw a
+   * token; if not, click Create via page.mouse (no Frame.evaluateExpression)
+   * and fail fast instead of waiting for the 300s Captcha timeout.
+   */
+  private async submitGenerateAfterCaptchaPass(
+    page: Page,
+    signal: AbortSignal
+  ): Promise<void> {
+    if (this.hasCapturedGenerateToken())
+      return;
+
+    logger.info('Waiting for auto-submit or hCaptcha teardown after pass');
+    await this.waitForGenerateTokenOrWidgetGone(page, signal, POST_CAPTCHA_AUTOSUBMIT_MS);
+    if (this.hasCapturedGenerateToken())
+      return;
+
+    await this.clickCreateSongByMouse(page, 'after captcha pass');
+    if (await this.waitUntilGenerateCaptured(page, signal, POST_CAPTCHA_GENERATE_WAIT_MS))
+      return;
+
+    logger.info('Generate not submitted after Create; retrying via page.mouse');
+    await this.clickCreateSongByMouse(page, 'retry');
+    if (await this.waitUntilGenerateCaptured(page, signal, POST_CAPTCHA_GENERATE_WAIT_MS))
+      return;
+    if (this.hasCapturedGenerateToken())
+      return;
+
+    const solve = this.activeCaptchaSolve;
+    if (solve && !solve.capturedToken)
+      solve.tokenSettled = true;
+    throw new Error(CAPTCHA_GENERATE_NOT_SUBMITTED);
+  }
+
   /**
    * If Turnstile is not already on screen, click Create song on /create.
    * Homepage Create usually submits after routing; this covers the case where
    * it only navigated and the generate control is still idle.
    */
-  private async isTurnstileVisible(page: Page): Promise<boolean> {
-    for (const frame of page.frames()) {
-      if (!/challenges\.cloudflare\.com/i.test(frame.url()))
-        continue;
-      try {
-        const box = await (await frame.frameElement()).boundingBox();
-        if (box && box.width > 40 && box.height > 40)
-          return true;
-      } catch {}
+  private async triggerCreateOnCreatePage(page: Page): Promise<void> {
+    if (page.isClosed() || this.captchaTokenCaptured())
+      return;
+    if (await this.isTurnstileVisible(page))
+      return;
+    let createSong: Locator;
+    try {
+      createSong = this.createSongButton(page);
+      await createSong.first().waitFor({ state: 'visible', timeout: 20000 });
+    } catch (err: any) {
+      if (this.captchaTokenCaptured() || isClosedCdpError(err) || err?.name === 'TimeoutError')
+        return;
+      throw err;
     }
-    return page.getByText('Verify you are human').isVisible().catch(() => false);
+    if (page.isClosed() || this.captchaTokenCaptured())
+      return;
+    if (await this.isTurnstileVisible(page))
+      return;
+    if (!(await createSong.first().isEnabled().catch(() => false)))
+      return;
+    logger.info('Clicking Create on /create');
+    try {
+      await this.click(createSong.first());
+    } catch (err: any) {
+      if (this.hasCapturedGenerateToken() || isClosedCdpError(err)) {
+        logger.info('Create click hit captcha teardown: ' + err.message);
+        if (!this.hasCapturedGenerateToken())
+          await this.clickCreateSongByMouse(page, 'locator click teardown');
+        return;
+      }
+      throw err;
+    }
   }
 
-  private async triggerCreateOnCreatePage(page: Page): Promise<void> {
-    if (await this.isTurnstileVisible(page))
+  private async clickCreateSongByMouse(page: Page, reason: string): Promise<void> {
+    if (page.isClosed() || this.hasCapturedGenerateToken())
       return;
-    const createSong = page.locator('button[aria-label="Create song"]');
     try {
-      await createSong.first().waitFor({ state: 'visible', timeout: 20000 });
-    } catch {
-      return;
-    }
-    if (await this.isTurnstileVisible(page))
-      return;
-    if (await createSong.first().isEnabled().catch(() => false)) {
-      logger.info('Clicking Create on /create');
-      await this.click(createSong.first());
+      const box = await this.createSongButton(page).first().boundingBox();
+      if (!box) {
+        logger.info('Create button has no box; skip mouse click (' + reason + ')');
+        return;
+      }
+      logger.info('Clicking Create via page.mouse (' + reason + ')');
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    } catch (err) {
+      if (this.hasCapturedGenerateToken() || isClosedCdpError(err))
+        return;
+      throw err;
     }
   }
 
@@ -1437,7 +1643,7 @@ class SunoApi {
       if (this.captchaTokenCaptured())
         return;
       logger.info(`hCaptcha attempt ${attempt + 1}/${MAX_CAPTCHA_ATTEMPTS}`);
-      const visible = await challenge.isVisible({ timeout: 4000 }).catch(() => false);
+      const visible = await this.isHcaptchaChallengeOpen(page);
       if (!visible) {
         if (attempt > 0 || this.captchaTokenCaptured() || !(await this.isHcaptchaVisible(page))) {
           logger.info('hCaptcha challenge gone after previous submit');
@@ -1448,10 +1654,11 @@ class SunoApi {
         await checkbox.first().click({ timeout: 8000 }).catch((e: any) => {
           logger.info('hCaptcha checkbox click failed: ' + e.message);
         });
-        try {
-          await challenge.waitFor({ state: 'visible', timeout: 15000 });
-        } catch {
-          if (this.captchaTokenCaptured() || !(await this.isHcaptchaVisible(page)))
+        const opened = await this.waitForHcaptchaChallengeOpen(page, signal, 15000);
+        if (this.captchaTokenCaptured())
+          return;
+        if (!opened) {
+          if (!(await this.isHcaptchaVisible(page)))
             return;
           throw new Error('hCaptcha challenge did not open within 15s');
         }
@@ -1557,7 +1764,7 @@ class SunoApi {
       } catch (e: any) {
         if (e.message.includes('viewport')) {
           await this.click(button);
-        } else if (!await challenge.isVisible().catch(() => false) || this.captchaTokenCaptured()) {
+        } else if (this.captchaTokenCaptured() || !(await this.isHcaptchaChallengeOpen(page))) {
           logger.info('hCaptcha submit skipped; challenge already closed');
           return;
         } else {
@@ -1565,7 +1772,7 @@ class SunoApi {
         }
       }
 
-      const outcome = await this.waitForHcaptchaOutcome(page, challenge, signal, 8000);
+      const outcome = await this.waitForHcaptchaOutcome(page, signal, 8000);
       if (outcome === 'passed') {
         logger.info('hCaptcha passed after attempt ' + (attempt + 1));
         return;
@@ -1588,7 +1795,6 @@ class SunoApi {
 
   private async waitForHcaptchaOutcome(
     page: Page,
-    challenge: Locator,
     signal: AbortSignal,
     timeoutMs: number
   ): Promise<'passed' | 'retry'> {
@@ -1598,18 +1804,11 @@ class SunoApi {
         throw new Error('AbortError');
       if (this.captchaTokenCaptured())
         return 'passed';
-      if (!(await this.isHcaptchaVisible(page)))
-        return 'passed';
-      const checked = await page.frameLocator('iframe[title*="hCaptcha"]')
-        .locator('[aria-checked="true"]').count().catch(() => 0);
-      const challengeVisible = await challenge.isVisible().catch(() => false);
-      if (checked > 0 && !challengeVisible)
-        return 'passed';
-      if (!challengeVisible)
+      if (!(await this.isHcaptchaChallengeOpen(page)))
         return 'passed';
       await sleep(0.4, 0.4);
     }
-    if (this.captchaTokenCaptured() || !(await this.isHcaptchaVisible(page)))
+    if (this.captchaTokenCaptured() || !(await this.isHcaptchaChallengeOpen(page)))
       return 'passed';
     return 'retry';
   }

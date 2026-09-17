@@ -30,6 +30,15 @@ export const isPage = (target: any): target is Page => {
   return target.constructor.name === 'Page';
 }
 
+/**
+ * Playwright/rebrowser errors from a frame or CDP session that already closed.
+ * Typical after hCaptcha unmounts while a locator still searches all frames.
+ */
+export function isClosedCdpError(err: unknown): boolean {
+  const message = String((err as { message?: string } | undefined)?.message || err || '');
+  return /session closed|Target closed|Execution context was destroyed|frame was detached|has been closed|Cannot find context|createIsolatedWorld|cannot get world/i.test(message);
+}
+
 export const HCAPTCHA_ASSET_URL =
   /^https:\/\/(img[a-zA-Z0-9]*\.hcaptcha\.com|hcaptcha-assets-prod\.suno\.com|hcaptcha-imgs-prod\.suno\.com)\/.*$/;
 

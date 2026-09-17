@@ -1750,6 +1750,10 @@ class SunoApi {
       let captcha: any;
       for (let j = 0; j < 3; j++) {
         try {
+          // Abort window: probe/sleep/prompt-read above may have spanned the
+          // abort — never send another paid 2Captcha call after it.
+          if (signal.aborted)
+            throw new Error('AbortError');
           logger.info('Sending the CAPTCHA to 2Captcha');
           const payload: paramsCoordinates = {
             body: (await challenge.screenshot({ timeout: 5000 })).toString('base64'),
@@ -1779,6 +1783,10 @@ class SunoApi {
         } catch(err: any) {
           if (this.captchaTokenCaptured())
             return;
+          // Abort (client gone / timeout): stop immediately — retrying would
+          // spend more paid 2Captcha calls on a solve nobody awaits anymore.
+          if (signal.aborted || err?.message === 'AbortError')
+            throw err;
           logger.info(err.message);
           if (j === 2) throw err;
           logger.info('Retrying...');
@@ -1787,6 +1795,10 @@ class SunoApi {
 
       if (this.captchaTokenCaptured())
         return;
+      // The solved captcha may have landed right after an abort; the result is
+      // useless (nobody awaits it) and the page is being reset — do not click.
+      if (signal.aborted)
+        throw new Error('AbortError');
 
       if (drag) {
         const challengeBox = await challenge.boundingBox();

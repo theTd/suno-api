@@ -3,7 +3,9 @@ import { Page } from 'rebrowser-playwright-core';
 /** Playwright 1.49 ships Chromium 131; used until browser.version() is known. */
 export const DEFAULT_CHROME_MAJOR = '131';
 
-export interface ChromeMacFingerprint {
+export type ChromePlatform = 'macOS' | 'Linux' | 'Windows';
+
+export interface ChromeFingerprint {
   chromeMajor: string;
   fullVersion: string;
   userAgent: string;
@@ -12,7 +14,8 @@ export interface ChromeMacFingerprint {
   languages: string[];
   brands: Array<{ brand: string; version: string }>;
   fullVersionList: Array<{ brand: string; version: string }>;
-  platform: 'macOS';
+  platform: ChromePlatform;
+  navigatorPlatform: string;
   platformVersion: string;
   viewport: { width: number; height: number };
   screen: { width: number; height: number };
@@ -20,6 +23,9 @@ export interface ChromeMacFingerprint {
   timezoneId: string;
   playwrightLocale: string;
 }
+
+/** @deprecated Use ChromeFingerprint; kept so existing imports type-check. */
+export type ChromeMacFingerprint = ChromeFingerprint;
 
 export function envInt(name: string, fallback: number): number {
   const raw = parseInt(process.env[name] || '', 10);
@@ -50,11 +56,70 @@ export function captchaWorkerLang(raw?: string): string {
   return 'en';
 }
 
+export function chromePlatformFromNode(nodePlatform = process.platform): ChromePlatform {
+  if (nodePlatform === 'linux')
+    return 'Linux';
+  if (nodePlatform === 'win32')
+    return 'Windows';
+  return 'macOS';
+}
+
+function platformIdentity(platform: ChromePlatform): {
+  userAgent: (fullVersion: string) => string;
+  navigatorPlatform: string;
+  platformVersion: string;
+  viewport: { width: number; height: number };
+  screen: { width: number; height: number };
+  deviceScaleFactor: number;
+  defaultTimezone: string;
+} {
+  if (platform === 'Linux') {
+    return {
+      userAgent: (fullVersion) =>
+        `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ` +
+        `(KHTML, like Gecko) Chrome/${fullVersion} Safari/537.36`,
+      navigatorPlatform: 'Linux x86_64',
+      platformVersion: '',
+      viewport: { width: 1920, height: 1080 },
+      screen: { width: 1920, height: 1080 },
+      deviceScaleFactor: 1,
+      defaultTimezone: 'UTC'
+    };
+  }
+  if (platform === 'Windows') {
+    return {
+      userAgent: (fullVersion) =>
+        `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ` +
+        `(KHTML, like Gecko) Chrome/${fullVersion} Safari/537.36`,
+      navigatorPlatform: 'Win32',
+      platformVersion: '15.0.0',
+      viewport: { width: 1920, height: 1080 },
+      screen: { width: 1920, height: 1080 },
+      deviceScaleFactor: 1,
+      defaultTimezone: 'UTC'
+    };
+  }
+  return {
+    userAgent: (fullVersion) =>
+      `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ` +
+      `(KHTML, like Gecko) Chrome/${fullVersion} Safari/537.36`,
+    navigatorPlatform: 'MacIntel',
+    platformVersion: '14.6.0',
+    viewport: { width: 1512, height: 982 },
+    screen: { width: 3024, height: 1964 },
+    deviceScaleFactor: 2,
+    defaultTimezone: 'America/Los_Angeles'
+  };
+}
+
 /**
- * Desktop Chrome-on-macOS identity. Brands never include HeadlessChrome.
- * Axios and the Chromium session must send the same UA + client hints.
+ * Desktop Chrome identity matching the process OS (Docker Linux stays Linux).
+ * Brands never include HeadlessChrome. Axios and Chromium must share UA + hints.
  */
-export function buildChromeMacFingerprint(chromeMajor?: string | number): ChromeMacFingerprint {
+export function buildChromeFingerprint(
+  chromeMajor?: string | number,
+  platform: ChromePlatform = chromePlatformFromNode()
+): ChromeFingerprint {
   const major = String(chromeMajor || process.env.BROWSER_CHROME_MAJOR || DEFAULT_CHROME_MAJOR)
     .split('.')[0]
     .replace(/\D/g, '') || DEFAULT_CHROME_MAJOR;
@@ -71,12 +136,11 @@ export function buildChromeMacFingerprint(chromeMajor?: string | number): Chrome
   const secChUa = brands.map((item) => `"${item.brand}";v="${item.version}"`).join(', ');
   const locale = playwrightLocaleFromEnv();
   const russian = locale.toLowerCase().startsWith('ru');
+  const id = platformIdentity(platform);
   return {
     chromeMajor: major,
     fullVersion,
-    userAgent:
-      `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ` +
-      `(KHTML, like Gecko) Chrome/${fullVersion} Safari/537.36`,
+    userAgent: id.userAgent(fullVersion),
     secChUa,
     acceptLanguage: russian
       ? 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
@@ -84,27 +148,33 @@ export function buildChromeMacFingerprint(chromeMajor?: string | number): Chrome
     languages: russian ? ['ru-RU', 'ru', 'en-US', 'en'] : ['en-US', 'en'],
     brands,
     fullVersionList,
-    platform: 'macOS',
-    platformVersion: '14.6.0',
-    viewport: { width: 1512, height: 982 },
-    screen: { width: 3024, height: 1964 },
-    deviceScaleFactor: 2,
-    timezoneId: process.env.BROWSER_TIMEZONE || 'America/Los_Angeles',
+    platform,
+    navigatorPlatform: id.navigatorPlatform,
+    platformVersion: id.platformVersion,
+    viewport: id.viewport,
+    screen: id.screen,
+    deviceScaleFactor: id.deviceScaleFactor,
+    timezoneId: process.env.BROWSER_TIMEZONE || id.defaultTimezone,
     playwrightLocale: locale
   };
 }
 
-export function fingerprintHttpHeaders(fp: ChromeMacFingerprint): Record<string, string> {
+/** Explicit macOS identity for tests. Runtime code should use buildChromeFingerprint(). */
+export function buildChromeMacFingerprint(chromeMajor?: string | number): ChromeFingerprint {
+  return buildChromeFingerprint(chromeMajor, 'macOS');
+}
+
+export function fingerprintHttpHeaders(fp: ChromeFingerprint): Record<string, string> {
   return {
     'User-Agent': fp.userAgent,
     'sec-ch-ua': fp.secChUa,
     'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"macOS"',
+    'sec-ch-ua-platform': `"${fp.platform}"`,
     'Accept-Language': fp.acceptLanguage
   };
 }
 
-export function contextOptionsFromFingerprint(fp: ChromeMacFingerprint) {
+export function contextOptionsFromFingerprint(fp: ChromeFingerprint) {
   return {
     userAgent: fp.userAgent,
     locale: fp.playwrightLocale,
@@ -118,18 +188,19 @@ export function contextOptionsFromFingerprint(fp: ChromeMacFingerprint) {
     extraHTTPHeaders: {
       'sec-ch-ua': fp.secChUa,
       'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"macOS"',
+      'sec-ch-ua-platform': `"${fp.platform}"`,
       'Accept-Language': fp.acceptLanguage
     }
   };
 }
 
-export function stealthInitPayload(fp: ChromeMacFingerprint) {
+export function stealthInitPayload(fp: ChromeFingerprint) {
   return {
     languages: fp.languages,
     language: fp.languages[0],
     userAgent: fp.userAgent,
-    platform: 'MacIntel',
+    platform: fp.navigatorPlatform,
+    uaPlatform: fp.platform,
     brands: fp.brands,
     fullVersionList: fp.fullVersionList,
     uaFullVersion: fp.fullVersion,
@@ -158,20 +229,20 @@ export function applyStealthInit(params: StealthInitParams): void {
   const uaData = {
     brands: params.brands,
     mobile: false,
-    platform: 'macOS',
+    platform: params.uaPlatform,
     getHighEntropyValues: async () => ({
       brands: params.brands,
       fullVersionList: params.fullVersionList,
       mobile: false,
       model: '',
-      platform: 'macOS',
+      platform: params.uaPlatform,
       platformVersion: params.platformVersion,
       architecture: 'x86',
       bitness: '64',
       uaFullVersion: params.uaFullVersion
     }),
     toJSON() {
-      return { brands: params.brands, mobile: false, platform: 'macOS' };
+      return { brands: params.brands, mobile: false, platform: params.uaPlatform };
     }
   };
   try {
@@ -188,19 +259,19 @@ export function applyStealthInit(params: StealthInitParams): void {
  */
 export async function applyChromiumUserAgentOverride(
   page: Page,
-  fp: ChromeMacFingerprint
+  fp: ChromeFingerprint
 ): Promise<void> {
   try {
     const session = await page.context().newCDPSession(page);
     await session.send('Emulation.setUserAgentOverride', {
       userAgent: fp.userAgent,
       acceptLanguage: fp.acceptLanguage,
-      platform: 'MacIntel',
+      platform: fp.navigatorPlatform,
       userAgentMetadata: {
         brands: fp.brands,
         fullVersionList: fp.fullVersionList,
         fullVersion: fp.fullVersion,
-        platform: 'macOS',
+        platform: fp.platform,
         platformVersion: fp.platformVersion,
         architecture: 'x86',
         model: '',
@@ -212,4 +283,43 @@ export async function applyChromiumUserAgentOverride(
   } catch {
     // Firefox and other non-CDP browsers skip this.
   }
+}
+
+export interface SunoCookieInject {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  sameSite: 'Lax';
+  secure: true;
+}
+
+/** Clerk host-only cookies need auth.suno.com as well as .suno.com. */
+export function sunoCookieInjectList(
+  cookies: Record<string, string | undefined>,
+  sessionJwt?: string
+): SunoCookieInject[] {
+  const out: SunoCookieInject[] = [];
+  const add = (name: string, value: string, domain: string) => {
+    out.push({
+      name,
+      value,
+      domain,
+      path: '/',
+      sameSite: 'Lax',
+      secure: true
+    });
+  };
+  if (sessionJwt)
+    add('__session', sessionJwt, '.suno.com');
+  for (const [key, value] of Object.entries(cookies)) {
+    if (!value)
+      continue;
+    if (key === '__session' && sessionJwt)
+      continue;
+    add(key, value, '.suno.com');
+    if (key === '__client' || key === '__session' || key.startsWith('__clerk'))
+      add(key, value, 'auth.suno.com');
+  }
+  return out;
 }

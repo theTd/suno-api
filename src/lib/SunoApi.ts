@@ -13,24 +13,30 @@ import {
 import { CaptchaGate, ClientGoneError } from '@/lib/captcha-gate';
 import { PAGE_FETCH_DEFAULT_TIMEOUT_MS, SunoBrowserSession } from '@/lib/suno-browser-session';
 import {
+  captchaEngageKind,
+  captchaNeedsPaidSolver,
   captchaSolverClickTarget,
   captchaTriggerPrompt,
   CREATE_WIDGET_WAIT_MS,
   isVerifiedSessionFresh,
   shouldClickHomepageCreateFallback,
   shouldReloadCreatePage,
-  studioWebApiHeaders
+  SILENT_PASS_WAIT_MS,
+  studioWebApiHeaders,
+  tokenlessGenerateAction,
+  type CaptchaEngageKind
 } from '@/lib/suno-captcha-policy';
 import {
   applyChromiumUserAgentOverride,
   applyStealthInit,
-  buildChromeMacFingerprint,
+  buildChromeFingerprint,
   captchaWorkerLang,
   contextOptionsFromFingerprint,
   envInt,
   fingerprintHttpHeaders,
   stealthInitPayload,
-  type ChromeMacFingerprint
+  sunoCookieInjectList,
+  type ChromeFingerprint
 } from '@/lib/suno-browser-fingerprint';
 import * as cookie from 'cookie';
 import { randomUUID } from 'node:crypto';
@@ -494,7 +500,7 @@ class SunoApi {
     capturedToken?: string;
     resolveToken: (token: string) => void;
   } | null = null;
-  private fingerprint: ChromeMacFingerprint = buildChromeMacFingerprint();
+  private fingerprint: ChromeFingerprint = buildChromeFingerprint();
   private browserSessionStartedAt = 0;
   private captchaSolveCount = 0;
   /** Last time /api/c/check was clean or a captcha-backed generate was accepted. */
@@ -692,7 +698,14 @@ class SunoApi {
   }
 
   private async captchaCheckOnce(signal?: AbortSignal): Promise<boolean> {
-    await this.ensureGeneratePage(signal);
+    const page = await this.ensureGeneratePage(signal);
+    await this.browserSession.withWrite(async () => {
+      if (page.isClosed())
+        return;
+      const textarea = page.mainFrame().locator('textarea').first();
+      if (await textarea.isVisible().catch(() => false))
+        await this.click(textarea);
+    });
     const resp = await this.browserSession.withRead(async () => {
       return this.browserSession.pageFetch(`${SunoApi.BASE_URL}/api/c/check`, {
         method: 'POST',
@@ -955,8 +968,13 @@ class SunoApi {
     } else {
       if (isPage(target))
         return target.mouse.click(position?.x ?? 0, position?.y ?? 0);
-      else
-        return target.click({ force: true, position });
+      else {
+        try {
+          return await target.click({ position, timeout: 3000 });
+        } catch {
+          return target.click({ force: true, position });
+        }
+      }
     }
   }
 
@@ -985,7 +1003,8 @@ class SunoApi {
       '--disable-blink-features=AutomationControlled',
       '--no-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-extensions'
+      '--disable-extensions',
+      '--disable-features=ThirdPartyCookiePhaseout,TrackingProtection3pcd'
     ];
     // Check for GPU acceleration, as it is recommended to turn it off for Docker
     if (yn(process.env.BROWSER_DISABLE_GPU, { default: false }))
@@ -1018,37 +1037,20 @@ class SunoApi {
     }
     const major = (browser.version() || '').split('.')[0];
     if (major && major !== this.fingerprint.chromeMajor) {
-      this.fingerprint = buildChromeMacFingerprint(major);
+      this.fingerprint = buildChromeFingerprint(major);
       this.userAgent = this.fingerprint.userAgent;
-      logger.info('Chromium ' + browser.version() + '; fingerprint Chrome/' + major);
+      logger.info(
+        'Chromium ' + browser.version()
+        + '; fingerprint Chrome/' + major
+        + ' ' + this.fingerprint.platform
+      );
     }
     const context = await browser.newContext({
       ...contextOptionsFromFingerprint(this.fingerprint),
       acceptDownloads: true
     });
     await context.addInitScript(applyStealthInit, stealthInitPayload(this.fingerprint));
-    const cookies = [];
-    const lax: 'Lax' | 'Strict' | 'None' = 'Lax';
-    cookies.push({
-      name: '__session',
-      value: this.currentToken+'',
-      domain: '.suno.com',
-      path: '/',
-      sameSite: lax,
-      secure: true,
-    });
-    for (const key in this.cookies) {
-      if (key === '__session') continue; // Already added with refreshed token above
-      cookies.push({
-        name: key,
-        value: this.cookies[key]+'',
-        domain: '.suno.com',
-        path: '/',
-        sameSite: lax,
-        secure: true,
-      })
-    }
-    await context.addCookies(cookies);
+    await context.addCookies(sunoCookieInjectList(this.cookies, this.currentToken));
     return { browser, context };
   }
 
@@ -1107,8 +1109,12 @@ class SunoApi {
       }
       const token = postData?.token;
       if (!token) {
-        logger.info('Dropping generate request without captcha token');
-        await route.abort();
+        if (tokenlessGenerateAction(solve.tokenSettled) === 'abort') {
+          await route.abort().catch(() => {});
+          return;
+        }
+        logger.info('Continuing generate request without captcha token');
+        await route.continue();
         return;
       }
       solve.capturedToken = token;
@@ -1253,8 +1259,8 @@ class SunoApi {
       });
 
       await this.triggerCreateOnCreatePage(page);
-      const engaged = await this.waitForCaptchaEngage(page, controller.signal, CREATE_WIDGET_WAIT_MS);
-      if (!engaged && !this.captchaTokenCaptured()) {
+      let engageKind = await this.waitForCaptchaEngage(page, controller.signal, CREATE_WIDGET_WAIT_MS);
+      if (engageKind === 'none' && !this.captchaTokenCaptured()) {
         const onCreate = /suno\.com\/create/.test(page.url());
         if (shouldClickHomepageCreateFallback({ onCreate, widgetOrToken: false })) {
           const homepageCreateVisible = await homepageCreate.isVisible().catch(() => false);
@@ -1266,7 +1272,17 @@ class SunoApi {
           logger.info('Retrying Create song after widget wait');
           await this.triggerCreateOnCreatePage(page);
         }
+        engageKind = await this.waitForCaptchaEngage(page, controller.signal, CREATE_WIDGET_WAIT_MS);
       }
+      if (engageKind !== 'token' && !this.captchaTokenCaptured()) {
+        const silent = await this.waitForCaptchaEngage(page, controller.signal, SILENT_PASS_WAIT_MS);
+        if (silent === 'token')
+          engageKind = silent;
+      }
+      if (this.captchaTokenCaptured())
+        logger.info('Generate token arrived without a paid CAPTCHA solve');
+      else if (captchaNeedsPaidSolver(engageKind))
+        logger.info('CAPTCHA overlay/turnstile visible; starting solver');
 
       const captchaPromise = this.solveDetectedCaptcha(page, controller.signal)
         .then(() => ({ type: 'solved' as const }))
@@ -1569,20 +1585,22 @@ class SunoApi {
     page: Page,
     signal: AbortSignal,
     timeoutMs: number
-  ): Promise<boolean> {
+  ): Promise<CaptchaEngageKind> {
     const deadline = Date.now() + timeoutMs;
+    const snapshot = async (): Promise<CaptchaEngageKind> => captchaEngageKind({
+      tokenCaptured: this.captchaTokenCaptured() || this.hasCapturedGenerateToken(),
+      overlayOpen: (await this.probeHcaptchaOverlay(page)) === 'open',
+      turnstileVisible: await this.isTurnstileVisible(page)
+    });
     while (Date.now() < deadline) {
       if (signal.aborted)
         throw new ClientGoneError();
-      if (this.captchaTokenCaptured())
-        return true;
-      if (await this.isTurnstileVisible(page) || await this.isHcaptchaVisible(page))
-        return true;
+      const kind = await snapshot();
+      if (kind !== 'none')
+        return kind;
       await waitMs(200);
     }
-    return this.captchaTokenCaptured()
-      || await this.isTurnstileVisible(page)
-      || await this.isHcaptchaVisible(page);
+    return snapshot();
   }
 
   private async clickCreateSongByMouse(page: Page, reason: string): Promise<void> {
@@ -1640,7 +1658,10 @@ class SunoApi {
       await this.solveTurnstileChallenge(page, signal);
     else if (kind === 'hcaptcha')
       await this.solveHcaptchaChallenge(page, signal);
-    else
+    else if (await this.isHcaptchaVisible(page)) {
+      logger.info('hCaptcha checkbox only; opening challenge if needed');
+      await this.solveHcaptchaChallenge(page, signal);
+    } else
       throw new Error('CAPTCHA required but no widget appeared');
   }
 
@@ -1664,10 +1685,10 @@ class SunoApi {
     while (Date.now() < deadline) {
       if (signal.aborted)
         throw new Error('AbortError');
-      if (this.captchaTokenCaptured())
+      if (this.captchaTokenCaptured() || this.hasCapturedGenerateToken())
         return 'passed';
-      // Generation captcha is hCaptcha; Clerk may also mount a Turnstile on /create.
-      if (await this.isHcaptchaVisible(page))
+      // Image overlay only — checkbox-only is a silent-pass candidate.
+      if ((await this.probeHcaptchaOverlay(page)) === 'open')
         return 'hcaptcha';
       if (await this.isTurnstileVisible(page))
         return 'turnstile';

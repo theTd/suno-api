@@ -6,6 +6,9 @@ export const DEFAULT_CAPTCHA_PASS_GRACE_MS = 3 * 60 * 1000;
 /** Wait for the widget after one Create click before any retry. */
 export const CREATE_WIDGET_WAIT_MS = 3500;
 
+/** Extra wait for a silent hCaptcha pass (token, no image overlay) before 2Captcha. */
+export const SILENT_PASS_WAIT_MS = 2500;
+
 export function captchaPassGraceMs(): number {
   return envInt('CAPTCHA_PASS_GRACE_MS', DEFAULT_CAPTCHA_PASS_GRACE_MS);
 }
@@ -83,6 +86,38 @@ export function captchaTriggerPrompt(prompt?: string): string {
  * Affiliate-Id, x-suno-client). Cookie / Origin / Referer / UA stay on the
  * Chromium fetch; do not override those here.
  */
+/**
+ * Empty-token generate/v2 during an active solve: aborting looks like a bot.
+ * After the captcha-backed POST has been sent, drop duplicates.
+ */
+export function tokenlessGenerateAction(tokenSettled: boolean): 'continue' | 'abort' {
+  return tokenSettled ? 'abort' : 'continue';
+}
+
+export type CaptchaEngageKind = 'token' | 'overlay' | 'turnstile' | 'none';
+
+/**
+ * Checkbox-only hCaptcha is not a paid-solver trigger. Wait for a generate
+ * token (silent pass) or the image overlay / Turnstile.
+ */
+export function captchaEngageKind(state: {
+  tokenCaptured: boolean;
+  overlayOpen: boolean;
+  turnstileVisible: boolean;
+}): CaptchaEngageKind {
+  if (state.tokenCaptured)
+    return 'token';
+  if (state.overlayOpen)
+    return 'overlay';
+  if (state.turnstileVisible)
+    return 'turnstile';
+  return 'none';
+}
+
+export function captchaNeedsPaidSolver(kind: CaptchaEngageKind): boolean {
+  return kind === 'overlay' || kind === 'turnstile';
+}
+
 export function studioWebApiHeaders(
   token: string | undefined,
   deviceId: string

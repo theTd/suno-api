@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  captchaEngageKind,
+  captchaNeedsPaidSolver,
   captchaSolverClickTarget,
   captchaTriggerPrompt,
   DEFAULT_CAPTCHA_PASS_GRACE_MS,
   isVerifiedSessionFresh,
   shouldClickHomepageCreateFallback,
   shouldReloadCreatePage,
-  studioWebApiHeaders
+  studioWebApiHeaders,
+  tokenlessGenerateAction
 } from './suno-captcha-policy';
 
 test('shouldReloadCreatePage keeps a passed checkbox session on /create', () => {
@@ -98,6 +101,30 @@ test('studioWebApiHeaders match the official web client custom headers', () => {
   assert.equal(headers['Device-Id'], '"device-1"');
   assert.equal(headers.Authorization, 'Bearer jwt-token');
   assert.equal(studioWebApiHeaders(undefined, 'device-1').Authorization, undefined);
+});
+
+test('tokenless generate continues until the captcha-backed POST is sent', () => {
+  assert.equal(tokenlessGenerateAction(false), 'continue');
+  assert.equal(tokenlessGenerateAction(true), 'abort');
+});
+
+test('captchaEngageKind ignores checkbox-only hCaptcha', () => {
+  assert.equal(
+    captchaEngageKind({ tokenCaptured: false, overlayOpen: false, turnstileVisible: false }),
+    'none'
+  );
+  assert.equal(
+    captchaEngageKind({ tokenCaptured: true, overlayOpen: false, turnstileVisible: false }),
+    'token'
+  );
+  assert.equal(
+    captchaEngageKind({ tokenCaptured: false, overlayOpen: true, turnstileVisible: false }),
+    'overlay'
+  );
+  assert.equal(captchaNeedsPaidSolver('none'), false);
+  assert.equal(captchaNeedsPaidSolver('token'), false);
+  assert.equal(captchaNeedsPaidSolver('overlay'), true);
+  assert.equal(captchaNeedsPaidSolver('turnstile'), true);
 });
 
 test('isVerifiedSessionFresh is a grace window, not a one-time token replay', () => {

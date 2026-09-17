@@ -106,7 +106,8 @@ docker compose build && docker compose up
 - `BROWSER` — the name of the browser that is going to be used to solve the CAPTCHA. Only `chromium` and `firefox` supported.
 - `BROWSER_GHOST_CURSOR` — use ghost-cursor-playwright to simulate smooth mouse movements. Please note that it doesn't seem to make any difference in the rate of CAPTCHAs, so you can set it to `false`. Retained for future testing.
 - `BROWSER_LOCALE` — the language of the browser. Using either `en` or `ru` is recommended, since those have the most workers on 2Captcha. [List of supported languages](https://2captcha.com/2captcha-api#language)
-- `BROWSER_HEADLESS` — run the browser without the window. You probably want to set this to `true`.
+- `BROWSER_HEADLESS` — run Chromium without a window. Keep this `false` when solving CAPTCHAs: Playwright's headless shell sends `sec-ch-ua: HeadlessChrome`, which makes Suno require a captcha on every generate. The Docker image runs headed Chromium under Xvfb.
+- `BROWSER_SESSION_MAX_AGE_MS` / `BROWSER_SESSION_MAX_SOLVES` — recycle the long-lived Chromium session after this age (default 2h) or this many captcha solves (default 20).
 - `CAPTCHA_QUEUE_MIN_INTERVAL_MS` / `CAPTCHA_QUEUE_MAX_INTERVAL_MS` — when one request triggers a CAPTCHA, the account enters a soft lock: later generate requests queue up FIFO instead of each launching their own browser solve, and are released one by one with a random interval between these two values (in ms) once the CAPTCHA is solved. Requests whose client disconnects while queued are dropped. Defaults: `2000` / `8000`.
 ```bash
 SUNO_COOKIE=<…>
@@ -114,7 +115,7 @@ TWOCAPTCHA_KEY=<…>
 BROWSER=chromium
 BROWSER_GHOST_CURSOR=false
 BROWSER_LOCALE=en
-BROWSER_HEADLESS=true
+BROWSER_HEADLESS=false
 CAPTCHA_QUEUE_MIN_INTERVAL_MS=2000
 CAPTCHA_QUEUE_MAX_INTERVAL_MS=8000
 ```

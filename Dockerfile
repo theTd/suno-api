@@ -20,6 +20,10 @@ RUN if [ -z "$SUNO_COOKIE" ]; then echo "Warning: SUNO_COOKIE is not set. You wi
 ENV SUNO_COOKIE=${SUNO_COOKIE}
 # Disable GPU acceleration, as with it suno-api won't work in a Docker environment
 ENV BROWSER_DISABLE_GPU=true
+# headless_shell sends sec-ch-ua: HeadlessChrome — Suno then requires a CAPTCHA on every generate.
+ENV BROWSER_HEADLESS=false
+ENV BROWSER_LOCALE=en
+ENV PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL=0
 
 RUN npm install --only=production                                                                                       
                                                                                                                     
@@ -32,5 +36,8 @@ COPY --from=builder /src/server.ts ./server.ts
 COPY --from=builder /src/src ./src
 COPY --from=builder /src/tsconfig.json ./tsconfig.json
 COPY --from=builder /src/next.config.mjs ./next.config.mjs
+COPY docker-entrypoint.sh ./docker-entrypoint.sh
+RUN chmod +x ./docker-entrypoint.sh
 EXPOSE 3000
+ENTRYPOINT ["./docker-entrypoint.sh"]
 CMD ["npm", "run", "start"]

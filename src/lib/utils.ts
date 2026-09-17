@@ -30,22 +30,67 @@ export const isPage = (target: any): target is Page => {
   return target.constructor.name === 'Page';
 }
 
+export const HCAPTCHA_ASSET_URL =
+  /^https:\/\/(img[a-zA-Z0-9]*\.hcaptcha\.com|hcaptcha-assets-prod\.suno\.com|hcaptcha-imgs-prod\.suno\.com)\/.*$/;
+
 /**
- * Waits for an hCaptcha image requests and then waits for all of them to end
- * @param page
- * @param signal `const controller = new AbortController(); controller.status`
- * @returns {Promise<void>} 
+ * Tracks only requests whose `start` was observed. Finishes for in-flight
+ * requests that began before the listener attached are ignored, so the idle
+ * counter cannot go negative and stall until the hard deadline.
+ */
+export class StartedRequestSet {
+  private inflight = new Set<object>();
+  seen = 0;
+
+  start(req: object): void {
+    if (this.inflight.has(req))
+      return;
+    this.inflight.add(req);
+    this.seen++;
+  }
+
+  /** Returns true when the tracked set is idle after this finish. */
+  end(req: object): boolean {
+    if (!this.inflight.has(req))
+      return this.inflight.size === 0;
+    this.inflight.delete(req);
+    return this.inflight.size === 0;
+  }
+
+  get idle(): boolean {
+    return this.inflight.size === 0;
+  }
+}
+
+export interface WaitForRequestsOptions {
+  hardDeadlineMs?: number;
+  /** When true, wait briefly for at least one new image request. Never throws if none arrive. */
+  requireRequests?: boolean;
+  idleMs?: number;
+  firstRequestTimeoutMs?: number;
+}
+
+/**
+ * Waits for hCaptcha image requests started *after* this call to settle.
+ * Zero new requests is not a failure: the challenge tiles may already be loaded
+ * (retry / late attach). Only AbortSignal rejects.
  */
 export const waitForRequests = (
   page: Page,
   signal: AbortSignal,
-  hardDeadlineMs: number = 45000
+  hardDeadlineMsOrOptions: number | WaitForRequestsOptions = 20000
 ): Promise<void> => {
+  const options: WaitForRequestsOptions = typeof hardDeadlineMsOrOptions === 'number'
+    ? { hardDeadlineMs: hardDeadlineMsOrOptions }
+    : (hardDeadlineMsOrOptions || {});
+  const hardDeadlineMs = options.hardDeadlineMs ?? 20000;
+  const requireRequests = options.requireRequests ?? true;
+  const idleMs = options.idleMs ?? 1000;
+  const firstRequestTimeoutMs = options.firstRequestTimeoutMs ?? 8000;
+
   return new Promise((resolve, reject) => {
-    const urlPattern = /^https:\/\/(img[a-zA-Z0-9]*\.hcaptcha\.com|hcaptcha-assets-prod\.suno\.com|hcaptcha-imgs-prod\.suno\.com)\/.*$/;
+    const tracker = new StartedRequestSet();
     let timeoutHandle: NodeJS.Timeout | null = null;
-    let activeRequestCount = 0;
-    let requestCount = 0;
     let settled = false;
 
     const cleanupListeners = () => {
@@ -59,55 +104,51 @@ export const waitForRequests = (
       if (settled) return;
       settled = true;
       cleanupListeners();
-      clearTimeout(initialTimeout);
+      clearTimeout(firstTimer);
       clearTimeout(hardDeadlineTimer);
       if (timeoutHandle)
         clearTimeout(timeoutHandle);
       if (err) reject(err); else resolve();
     };
 
-    const resetTimeout = () => {
+    const armIdle = () => {
       if (timeoutHandle)
         clearTimeout(timeoutHandle);
-      if (activeRequestCount === 0) {
-        timeoutHandle = setTimeout(() => {
-          logger.info(`hCaptcha image requests settled (${requestCount} seen)`);
-          finish();
-        }, 1000); // 1 second of no requests
-      }
+      if (!tracker.idle)
+        return;
+      timeoutHandle = setTimeout(() => {
+        logger.info(`hCaptcha image requests settled (${tracker.seen} seen)`);
+        finish();
+      }, idleMs);
     };
 
     const onRequest = (request: { url: () => string }) => {
-      if (urlPattern.test(request.url())) {
-        requestCount++;
-        activeRequestCount++;
-        if (timeoutHandle)
-          clearTimeout(timeoutHandle);
-        clearTimeout(initialTimeout);
-      }
+      if (!HCAPTCHA_ASSET_URL.test(request.url()))
+        return;
+      tracker.start(request as object);
+      if (timeoutHandle)
+        clearTimeout(timeoutHandle);
+      clearTimeout(firstTimer);
     };
 
     const onRequestFinished = (request: { url: () => string }) => {
-      if (urlPattern.test(request.url())) {
-        activeRequestCount--;
-        resetTimeout();
-      }
+      if (!HCAPTCHA_ASSET_URL.test(request.url()))
+        return;
+      if (tracker.end(request as object) && tracker.seen > 0)
+        armIdle();
     };
 
-    // Wait for an hCaptcha request for up to 30 seconds
-    const initialTimeout = setTimeout(() => {
-      if (requestCount === 0) {
-        finish(new Error('No hCaptcha request occurred within 30 seconds.'));
-      } else {
-        // Requests started but never quiesced; proceed with whatever has loaded
-        logger.info(`hCaptcha requests seen but never quiesced (${requestCount} total); proceeding`);
+    const firstTimer = setTimeout(() => {
+      if (tracker.seen === 0) {
+        logger.info('No new hCaptcha image requests; proceeding with current challenge');
         finish();
+      } else if (tracker.idle) {
+        armIdle();
       }
-    }, 30000);
+    }, requireRequests ? firstRequestTimeoutMs : Math.min(firstRequestTimeoutMs, idleMs));
 
-    // Absolute cap: never wait longer than hardDeadlineMs, no matter what
     const hardDeadlineTimer = setTimeout(() => {
-      logger.info(`hCaptcha wait hit hard deadline after ${hardDeadlineMs}ms (${requestCount} requests)`);
+      logger.info(`hCaptcha wait hit hard deadline after ${hardDeadlineMs}ms (${tracker.seen} requests)`);
       finish();
     }, hardDeadlineMs);
 
@@ -120,6 +161,9 @@ export const waitForRequests = (
     };
 
     signal.addEventListener('abort', onAbort, { once: true });
+
+    if (!requireRequests && tracker.idle)
+      armIdle();
   });
 }
 

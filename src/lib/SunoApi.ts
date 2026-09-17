@@ -1,10 +1,20 @@
 import axios, { AxiosInstance } from 'axios';
-import UserAgent from 'user-agents';
 import pino from 'pino';
 import yn from 'yn';
 import { isPage, sleep, waitForRequests } from '@/lib/utils';
 import { CaptchaGate, ClientGoneError } from '@/lib/captcha-gate';
 import { PAGE_FETCH_DEFAULT_TIMEOUT_MS, SunoBrowserSession } from '@/lib/suno-browser-session';
+import {
+  applyChromiumUserAgentOverride,
+  applyStealthInit,
+  buildChromeMacFingerprint,
+  captchaWorkerLang,
+  contextOptionsFromFingerprint,
+  envInt,
+  fingerprintHttpHeaders,
+  stealthInitPayload,
+  type ChromeMacFingerprint
+} from '@/lib/suno-browser-fingerprint';
 import * as cookie from 'cookie';
 import { randomUUID } from 'node:crypto';
 import { Solver } from '@2captcha/captcha-solver';
@@ -448,6 +458,17 @@ class SunoApi {
   private browserSession: SunoBrowserSession;
   private generatePageInflight?: Promise<Page>;
   private captchaRouteEpoch = 0;
+  private generateRoutePages = new WeakSet<Page>();
+  private activeCaptchaSolve: {
+    page: Page;
+    submitOptions?: GenerateSongsOptions;
+    tokenSettled: boolean;
+    capturedToken?: string;
+    resolveToken: (token: string) => void;
+  } | null = null;
+  private fingerprint: ChromeMacFingerprint = buildChromeMacFingerprint();
+  private browserSessionStartedAt = 0;
+  private captchaSolveCount = 0;
   private ghostCursorEnabled = yn(process.env.BROWSER_GHOST_CURSOR, { default: false });
   private cursor?: Cursor;
   private feedListCache?: { key: string; at: number; data: AudioInfo[] };
@@ -472,7 +493,7 @@ class SunoApi {
 
   constructor(cookies: string) {
     this.cookieKey = cookies;
-    this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
+    this.userAgent = this.fingerprint.userAgent;
     this.cookies = cookie.parse(cookies);
     this.deviceId = this.cookies.ajs_anonymous_id || randomUUID();
     this.client = axios.create({
@@ -480,17 +501,15 @@ class SunoApi {
       headers: {
         'Affiliate-Id': 'undefined',
         'Device-Id': `"${this.deviceId}"`,
-        'x-suno-client': 'Android prerelease-4nt180t 1.0.42',
-        'X-Requested-With': 'com.suno.android',
-        'sec-ch-ua': '"Chromium";v="130", "Android WebView";v="130", "Not?A_Brand";v="99"',
-        'sec-ch-ua-mobile': '?1',
-        'sec-ch-ua-platform': '"Android"',
-        'User-Agent': this.userAgent
+        'x-suno-client': 'suno-web',
+        ...fingerprintHttpHeaders(this.fingerprint)
       }
     });
     this.client.interceptors.request.use(config => {
       if (this.currentToken && !config.headers.Authorization)
         config.headers.Authorization = `Bearer ${this.currentToken}`;
+      Object.assign(config.headers, fingerprintHttpHeaders(this.fingerprint));
+      config.headers['x-suno-client'] = 'suno-web';
       const cookiesArray = Object.entries(this.cookies).map(([key, value]) => 
         cookie.serialize(key, value as string)
       );
@@ -690,14 +709,21 @@ class SunoApi {
 
   private async ensureGeneratePageUnqueued(): Promise<Page> {
     const { page, reused, newBrowser } = await this.browserSession.ensurePage(async (next) => {
+      await applyChromiumUserAgentOverride(next, this.fingerprint);
       await this.installTurnstileHook(next);
+      await this.ensureGenerateRoute(next);
     });
-    if (newBrowser)
+    if (newBrowser) {
+      this.browserSessionStartedAt = Date.now();
+      this.captchaSolveCount = 0;
       logger.info('Launching browser... (new session)');
+    }
     else if (!reused)
       logger.info('Chromium session: new page on existing browser');
     else
       logger.info('Reusing Chromium session');
+
+    await this.ensureGenerateRoute(page);
 
     if (this.ghostCursorEnabled && !reused)
       this.cursor = await createCursor(page);
@@ -801,29 +827,50 @@ class SunoApi {
   private async launchBrowser(): Promise<{ browser: Browser; context: BrowserContext }> {
     const args = [
       '--disable-blink-features=AutomationControlled',
-      '--disable-web-security',
       '--no-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-features=site-per-process',
-      '--disable-features=IsolateOrigins',
-      '--disable-extensions',
-      '--disable-infobars'
+      '--disable-extensions'
     ];
     // Check for GPU acceleration, as it is recommended to turn it off for Docker
     if (yn(process.env.BROWSER_DISABLE_GPU, { default: false }))
       args.push('--enable-unsafe-swiftshader',
         '--disable-gpu',
         '--disable-setuid-sandbox');
-    const browser = await this.getBrowserType().launch({
-      args,
-      headless: yn(process.env.BROWSER_HEADLESS, { default: true })
-    });
+    const browserType = this.getBrowserType();
+    const isChromium = browserType === chromium;
+    process.env.PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL = '0';
+    const headless = yn(process.env.BROWSER_HEADLESS, { default: false });
+    let browser: Browser;
+    if (isChromium) {
+      const stealthLaunch = {
+        args,
+        headless,
+        ignoreDefaultArgs: ['--enable-automation'] as string[]
+      };
+      try {
+        // executablePath() is the full chrome binary, not chromium-headless-shell.
+        browser = await chromium.launch({
+          ...stealthLaunch,
+          executablePath: chromium.executablePath()
+        });
+      } catch (err: any) {
+        logger.warn('Full Chromium executablePath launch failed: ' + err.message);
+        browser = await chromium.launch(stealthLaunch);
+      }
+    } else {
+      browser = await browserType.launch({ args, headless });
+    }
+    const major = (browser.version() || '').split('.')[0];
+    if (major && major !== this.fingerprint.chromeMajor) {
+      this.fingerprint = buildChromeMacFingerprint(major);
+      this.userAgent = this.fingerprint.userAgent;
+      logger.info('Chromium ' + browser.version() + '; fingerprint Chrome/' + major);
+    }
     const context = await browser.newContext({
-      userAgent: this.userAgent,
-      locale: process.env.BROWSER_LOCALE,
-      viewport: null,
+      ...contextOptionsFromFingerprint(this.fingerprint),
       acceptDownloads: true
     });
+    await context.addInitScript(applyStealthInit, stealthInitPayload(this.fingerprint));
     const cookies = [];
     const lax: 'Lax' | 'Strict' | 'None' = 'Lax';
     cookies.push({
@@ -849,10 +896,133 @@ class SunoApi {
     return { browser, context };
   }
 
+  private captchaTokenCaptured(): boolean {
+    return !!this.activeCaptchaSolve?.tokenSettled;
+  }
+
+  private shouldRecycleBrowserSession(): boolean {
+    const maxAge = envInt('BROWSER_SESSION_MAX_AGE_MS', 2 * 60 * 60 * 1000);
+    const maxSolves = envInt('BROWSER_SESSION_MAX_SOLVES', 20);
+    if (!this.browserSession.isAlive())
+      return false;
+    if (this.browserSessionStartedAt > 0 && Date.now() - this.browserSessionStartedAt >= maxAge)
+      return true;
+    return this.captchaSolveCount >= maxSolves;
+  }
+
+  private async recycleBrowserSession(reason: string): Promise<void> {
+    logger.info('Recycling Chromium session: ' + reason);
+    await this.browserSession.invalidate().catch(() => {});
+    this.captchaSolveCount = 0;
+    this.browserSessionStartedAt = 0;
+  }
+
+  private async ensureGenerateRoute(page: Page): Promise<void> {
+    if (page.isClosed() || this.generateRoutePages.has(page))
+      return;
+    this.generateRoutePages.add(page);
+    await page.route(/\/api\/generate\/v2/, (route) => this.onGenerateRoute(route, page));
+  }
+
+  private async onGenerateRoute(route: any, page: Page): Promise<void> {
+    const solve = this.activeCaptchaSolve;
+    if (!solve || solve.page !== page) {
+      await route.continue();
+      return;
+    }
+    if (solve.tokenSettled) {
+      await route.abort().catch(() => {});
+      return;
+    }
+    try {
+      const request = route.request();
+      let postData: any;
+      try {
+        postData = request.postDataJSON();
+      } catch {
+        await route.abort();
+        return;
+      }
+      const token = postData?.token;
+      if (!token) {
+        logger.info('Dropping generate request without captcha token');
+        await route.abort();
+        return;
+      }
+      solve.capturedToken = token;
+      solve.tokenSettled = true;
+      if (postData?.token_provider != null)
+        this.captchaTokenProvider = postData.token_provider;
+      const bearer = request.headers().authorization?.split('Bearer ').pop();
+      if (bearer)
+        this.currentToken = bearer;
+      logger.info('Captured generate captcha token from ' + request.url());
+
+      if (!solve.submitOptions) {
+        solve.resolveToken(token);
+        await route.abort();
+        return;
+      }
+
+      const sessionToken =
+        postData?.metadata?.create_session_token
+        || this.createSessionToken
+        || randomUUID();
+      const payload = bindCaptchaGeneratePayload(
+        buildGenerateV2Payload(solve.submitOptions, {
+          captchaToken: token,
+          captchaTokenProvider: this.captchaTokenProvider,
+          userTier: extractUserTierFromJwt(this.currentToken),
+          createSessionToken: sessionToken,
+          transactionUuid: postData?.transaction_uuid
+        }),
+        postData
+      );
+      this.createSessionToken = payload.metadata?.create_session_token || sessionToken;
+      this.captchaTransactionUuid = payload.transaction_uuid;
+      logger.info('Submitting generate via browser intercept (same TLS/JWT as captcha)');
+      const responsePromise = page.waitForResponse(
+        (resp) => resp.request() === request,
+        { timeout: 20000 }
+      );
+      const pendingResponse = responsePromise.catch(() => null);
+      await route.continue({ postData: JSON.stringify(payload) });
+      const response = await pendingResponse;
+      if (!response)
+        throw new Error('Browser generate produced no response');
+      const body = await response.text();
+      let clips: any[] | undefined;
+      try {
+        const parsed = JSON.parse(body);
+        if (Array.isArray(parsed?.clips))
+          clips = parsed.clips;
+      } catch {}
+      if (clips && clips.length > 0) {
+        this.captchaBrowserClips = clips;
+        logger.info('Browser generate accepted ' + clips.length + ' clip(s)');
+      } else {
+        const snippet = body.replace(/\s+/g, ' ').slice(0, 240);
+        this.captchaBrowserError =
+          'Suno rejected the captcha-backed generate (' + response.status() + '): ' + snippet;
+        logger.warn(this.captchaBrowserError);
+      }
+      solve.resolveToken(token);
+    } catch (err) {
+      await route.abort().catch(() => {});
+      logger.warn('Generate intercept error: ' + (err as Error).message);
+      if (solve.tokenSettled) {
+        if (!this.captchaBrowserClips && !this.captchaBrowserError)
+          this.captchaBrowserError = 'Browser generate fetch failed: ' + (err as Error).message;
+        if (solve.capturedToken)
+          solve.resolveToken(solve.capturedToken);
+      }
+    }
+  }
+
   /**
    * Checks for CAPTCHA verification and solves the CAPTCHA if needed.
-   * Suno currently serves Cloudflare Turnstile (captcha_version 2) and may
-   * still fall back to hCaptcha (version 1).
+   * Suno currently serves hCaptcha and may also show a Clerk Turnstile widget
+   * on /create; widget kind is sniffed, with hCaptcha preferred.
    *
    * Check and solve both run on the long-lived Chromium session page.
    * When `submitOptions` is provided, the intercepted browser generate is
@@ -876,6 +1046,7 @@ class SunoApi {
     // Becoming the solver engages the per-account soft lock so concurrent
     // requests queue up instead of each launching their own browser + 2Captcha solve.
     engage();
+    this.captchaSolveCount++;
     logger.info('CAPTCHA required. Using Chromium session...');
     const page = await this.ensureGeneratePage(signal);
     const controller = new AbortController();
@@ -883,14 +1054,12 @@ class SunoApi {
     const onExternalAbort = () => controller.abort();
     if (signal)
       signal.addEventListener('abort', onExternalAbort, { once: true });
-    let routeHandler: ((route: any) => Promise<void>) | null = null;
-    const generateRoute = /\/api\/generate\/v2/;
-    const routeEpoch = ++this.captchaRouteEpoch;
 
     try {
       return await this.browserSession.withWrite(async () => {
       logger.info('Triggering the CAPTCHA');
       await this.dismissOverlays(page);
+      await this.ensureGenerateRoute(page);
 
       const textarea = page.locator('textarea').first();
       await this.click(textarea);
@@ -900,115 +1069,21 @@ class SunoApi {
       const homepageCreate = page.locator('button:has-text("Create")').first();
       const button = (await createSong.count()) > 0 ? createSong.first() : homepageCreate;
 
-      let tokenSettled = false;
       const tokenPromise = new Promise<string>((resolve, reject) => {
-        let capturedToken: string | undefined;
+        this.activeCaptchaSolve = {
+          page,
+          submitOptions,
+          tokenSettled: false,
+          resolveToken: resolve
+        };
         const onAbort = () => {
-          if (!tokenSettled) {
-            tokenSettled = true;
+          const solve = this.activeCaptchaSolve;
+          if (solve && !solve.tokenSettled) {
+            solve.tokenSettled = true;
             reject(signal?.aborted ? new ClientGoneError() : new Error('Captcha timeout'));
           }
         };
         controller.signal.addEventListener('abort', onAbort, { once: true });
-        routeHandler = async (route: any) => {
-          if (routeEpoch !== this.captchaRouteEpoch) {
-            await route.continue();
-            return;
-          }
-          if (tokenSettled) {
-            route.abort();
-            return;
-          }
-          try {
-            const request = route.request();
-            let postData: any;
-            try {
-              postData = request.postDataJSON();
-            } catch {
-              route.abort();
-              return;
-            }
-            const token = postData?.token;
-            if (!token) {
-              logger.info('Dropping generate request without captcha token');
-              route.abort();
-              return;
-            }
-            capturedToken = token;
-            tokenSettled = true;
-            if (postData?.token_provider != null)
-              this.captchaTokenProvider = postData.token_provider;
-            const bearer = request.headers().authorization?.split('Bearer ').pop();
-            if (bearer)
-              this.currentToken = bearer;
-            logger.info('Captured generate captcha token from ' + request.url());
-            controller.signal.removeEventListener('abort', onAbort);
-
-            if (!submitOptions) {
-              resolve(token);
-              route.abort();
-              return;
-            }
-
-            const sessionToken =
-              postData?.metadata?.create_session_token
-              || this.createSessionToken
-              || randomUUID();
-            const payload = bindCaptchaGeneratePayload(
-              buildGenerateV2Payload(submitOptions, {
-                captchaToken: token,
-                captchaTokenProvider: this.captchaTokenProvider,
-                userTier: extractUserTierFromJwt(this.currentToken),
-                createSessionToken: sessionToken,
-                transactionUuid: postData?.transaction_uuid
-              }),
-              postData
-            );
-            this.createSessionToken = payload.metadata?.create_session_token || sessionToken;
-            this.captchaTransactionUuid = payload.transaction_uuid;
-            logger.info('Submitting generate via browser intercept (same TLS/JWT as captcha)');
-            // waitForResponse (not request.response()): the latter returns null
-            // immediately if the response has not arrived yet and does not wait.
-            // Attach catch before continue so a failed continue cannot leave an
-            // unhandled rejection when the page later closes.
-            const responsePromise = page.waitForResponse(
-              (resp) => resp.request() === request,
-              { timeout: 20000 }
-            );
-            const pendingResponse = responsePromise.catch(() => null);
-            await route.continue({ postData: JSON.stringify(payload) });
-            const response = await pendingResponse;
-            if (!response)
-              throw new Error('Browser generate produced no response');
-            const body = await response.text();
-            let clips: any[] | undefined;
-            try {
-              const parsed = JSON.parse(body);
-              if (Array.isArray(parsed?.clips))
-                clips = parsed.clips;
-            } catch {}
-            if (clips && clips.length > 0) {
-              this.captchaBrowserClips = clips;
-              logger.info('Browser generate accepted ' + clips.length + ' clip(s)');
-            } else {
-              const snippet = body.replace(/\s+/g, ' ').slice(0, 240);
-              this.captchaBrowserError =
-                'Suno rejected the captcha-backed generate (' + response.status() + '): ' + snippet;
-              logger.warn(this.captchaBrowserError);
-            }
-            resolve(token);
-          } catch(err) {
-            route.abort().catch(() => {});
-            logger.warn('Generate intercept error: ' + (err as Error).message);
-            if (tokenSettled) {
-              if (!this.captchaBrowserClips && !this.captchaBrowserError)
-                this.captchaBrowserError = 'Browser generate fetch failed: ' + (err as Error).message;
-              if (capturedToken)
-                resolve(capturedToken);
-            }
-          }
-        };
-        page.route(generateRoute, routeHandler);
       });
 
       await this.triggerCreateOnCreatePage(page);
@@ -1039,7 +1114,7 @@ class SunoApi {
           return lateToken;
         throw new Error('CAPTCHA solver failed: ' + (raced.err?.message || 'unknown'));
       }
-      if (!tokenSettled)
+      if (!this.captchaTokenCaptured())
         await this.triggerCreateOnCreatePage(page);
       return await tokenPromise;
       });
@@ -1054,25 +1129,25 @@ class SunoApi {
       }
       throw err;
     } finally {
+      this.activeCaptchaSolve = null;
       this.captchaRouteEpoch++;
       clearTimeout(timeoutId);
       controller.abort();
       if (signal)
         signal.removeEventListener('abort', onExternalAbort);
-      try {
-        if (!page.isClosed() && routeHandler) {
-          await Promise.race([
-            page.unroute(generateRoute, routeHandler),
-            waitMs(5000).then(() => logger.info('page.unroute timed out; session kept alive'))
-          ]);
-        }
-      } catch {
-        // never block on unroute; stale handlers no-op via captchaRouteEpoch
-      }
-      if (this.browserSession.isAlive())
+      const recycle = this.shouldRecycleBrowserSession();
+      if (recycle) {
+        const ageMin = this.browserSessionStartedAt
+          ? Math.round((Date.now() - this.browserSessionStartedAt) / 60000)
+          : 0;
+        await this.recycleBrowserSession(
+          `age=${ageMin}m solves=${this.captchaSolveCount}`
+        );
+      } else if (this.browserSession.isAlive()) {
         await this.browserSession.withWrite(() => this.ensureOnCreatePage(page, true)).catch((e: any) => {
           logger.info('Post-captcha /create reset failed: ' + e.message);
         });
+      }
     }
   }
 
@@ -1223,6 +1298,8 @@ class SunoApi {
   ): Promise<void> {
     const kind = await this.waitForCaptchaKind(page, signal);
     logger.info('Detected CAPTCHA kind: ' + kind);
+    if (kind === 'passed')
+      return;
     if (kind === 'turnstile')
       await this.solveTurnstileChallenge(page, signal);
     else if (kind === 'hcaptcha')
@@ -1235,19 +1312,18 @@ class SunoApi {
     page: Page,
     signal: AbortSignal,
     timeoutMs: number = 60000
-  ): Promise<'turnstile' | 'hcaptcha' | 'none'> {
+  ): Promise<'turnstile' | 'hcaptcha' | 'none' | 'passed'> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (signal.aborted)
         throw new Error('AbortError');
+      if (this.captchaTokenCaptured())
+        return 'passed';
+      // Generation captcha is hCaptcha; Clerk may also mount a Turnstile on /create.
+      if (await this.isHcaptchaVisible(page))
+        return 'hcaptcha';
       if (await this.isTurnstileVisible(page))
         return 'turnstile';
-      const hcaptchaIframe = page.locator('iframe[title*="hCaptcha"]');
-      if (await hcaptchaIframe.count() > 0) {
-        const visible = await hcaptchaIframe.first().isVisible().catch(() => false);
-        if (visible)
-          return 'hcaptcha';
-      }
       await sleep(0.4, 0.4);
     }
     return 'none';
@@ -1277,6 +1353,8 @@ class SunoApi {
   private async solveTurnstileChallenge(page: Page, signal: AbortSignal): Promise<void> {
     if (signal.aborted)
       throw new Error('AbortError');
+    if (this.captchaTokenCaptured())
+      return;
 
     // Managed widgets sometimes pass after a real click; skip 2Captcha when that happens.
     const checkboxFrame = this.turnstileFrame(page);
@@ -1356,10 +1434,12 @@ class SunoApi {
     for (let attempt = 0; attempt < MAX_CAPTCHA_ATTEMPTS; attempt++) {
       if (signal.aborted)
         throw new Error('AbortError');
+      if (this.captchaTokenCaptured())
+        return;
       logger.info(`hCaptcha attempt ${attempt + 1}/${MAX_CAPTCHA_ATTEMPTS}`);
       const visible = await challenge.isVisible({ timeout: 4000 }).catch(() => false);
       if (!visible) {
-        if (attempt > 0) {
+        if (attempt > 0 || this.captchaTokenCaptured() || !(await this.isHcaptchaVisible(page))) {
           logger.info('hCaptcha challenge gone after previous submit');
           return;
         }
@@ -1371,11 +1451,32 @@ class SunoApi {
         try {
           await challenge.waitFor({ state: 'visible', timeout: 15000 });
         } catch {
+          if (this.captchaTokenCaptured() || !(await this.isHcaptchaVisible(page)))
+            return;
           throw new Error('hCaptcha challenge did not open within 15s');
         }
       }
-      await waitForRequests(page, signal, 45000);
-      await sleep(3, 3); // Allow challenge images to fully render before screenshot
+      if (attempt === 0) {
+        await waitForRequests(page, signal, {
+          hardDeadlineMs: 20000,
+          requireRequests: true,
+          firstRequestTimeoutMs: 8000
+        });
+      } else {
+        const promptReady = await challenge.locator('.prompt-text').first().isVisible().catch(() => false);
+        if (!promptReady) {
+          await waitForRequests(page, signal, {
+            hardDeadlineMs: 4000,
+            requireRequests: false,
+            idleMs: 400,
+            firstRequestTimeoutMs: 1500
+          });
+        }
+      }
+      await sleep(1, 1);
+
+      if (this.captchaTokenCaptured())
+        return;
 
       const promptText = await challenge.locator('.prompt-text')
         .first().innerText().catch(() => '');
@@ -1388,7 +1489,7 @@ class SunoApi {
           logger.info('Sending the CAPTCHA to 2Captcha');
           const payload: paramsCoordinates = {
             body: (await challenge.screenshot({ timeout: 5000 })).toString('base64'),
-            lang: process.env.BROWSER_LOCALE
+            lang: captchaWorkerLang()
           };
           if (drag) {
             payload.textinstructions = 'CLICK on the shapes at their edge or center as shown above—please be precise!';
@@ -1396,19 +1497,32 @@ class SunoApi {
               path.join(process.cwd(), 'public', 'drag-instructions.jpg')
             )).toString('base64');
           }
-          captcha = await Promise.race([
-            this.solver.coordinates(payload),
-            waitMs(90000).then(() => {
-              throw new Error('2Captcha coordinates timed out after 90s');
-            })
+          const solved = await Promise.race([
+            this.solver.coordinates(payload).then((data) => ({ type: 'captcha' as const, data })),
+            waitMs(90000).then(() => ({ type: 'timeout' as const })),
+            this.waitUntilTokenOrAbort(signal).then((kind) =>
+              kind === 'token' ? { type: 'token' as const } : { type: 'abort' as const }
+            )
           ]);
+          if (solved.type === 'token')
+            return;
+          if (solved.type === 'abort')
+            throw new Error('AbortError');
+          if (solved.type === 'timeout')
+            throw new Error('2Captcha coordinates timed out after 90s');
+          captcha = solved.data;
           break;
         } catch(err: any) {
+          if (this.captchaTokenCaptured())
+            return;
           logger.info(err.message);
           if (j === 2) throw err;
           logger.info('Retrying...');
         }
       }
+
+      if (this.captchaTokenCaptured())
+        return;
 
       if (drag) {
         const challengeBox = await challenge.boundingBox();
@@ -1443,7 +1557,7 @@ class SunoApi {
       } catch (e: any) {
         if (e.message.includes('viewport')) {
           await this.click(button);
-        } else if (!await challenge.isVisible().catch(() => false)) {
+        } else if (!await challenge.isVisible().catch(() => false) || this.captchaTokenCaptured()) {
           logger.info('hCaptcha submit skipped; challenge already closed');
           return;
         } else {
@@ -1451,7 +1565,7 @@ class SunoApi {
         }
       }
 
-      const outcome = await this.waitForHcaptchaOutcome(challenge, signal, 8000);
+      const outcome = await this.waitForHcaptchaOutcome(page, challenge, signal, 8000);
       if (outcome === 'passed') {
         logger.info('hCaptcha passed after attempt ' + (attempt + 1));
         return;
@@ -1459,10 +1573,21 @@ class SunoApi {
       logger.info('hCaptcha still visible after submit; retrying');
     }
 
+    if (this.captchaTokenCaptured())
+      return;
     throw new Error('hCaptcha max attempts exceeded');
   }
 
+  private async waitUntilTokenOrAbort(signal: AbortSignal): Promise<'token' | 'abort'> {
+    while (!signal.aborted && !this.captchaTokenCaptured())
+      await waitMs(200);
+    if (this.captchaTokenCaptured())
+      return 'token';
+    return 'abort';
+  }
+
   private async waitForHcaptchaOutcome(
+    page: Page,
     challenge: Locator,
     signal: AbortSignal,
     timeoutMs: number
@@ -1471,11 +1596,21 @@ class SunoApi {
     while (Date.now() < deadline) {
       if (signal.aborted)
         throw new Error('AbortError');
-      const visible = await challenge.isVisible().catch(() => false);
-      if (!visible)
+      if (this.captchaTokenCaptured())
+        return 'passed';
+      if (!(await this.isHcaptchaVisible(page)))
+        return 'passed';
+      const checked = await page.frameLocator('iframe[title*="hCaptcha"]')
+        .locator('[aria-checked="true"]').count().catch(() => 0);
+      const challengeVisible = await challenge.isVisible().catch(() => false);
+      if (checked > 0 && !challengeVisible)
+        return 'passed';
+      if (!challengeVisible)
         return 'passed';
       await sleep(0.4, 0.4);
     }
+    if (this.captchaTokenCaptured() || !(await this.isHcaptchaVisible(page)))
+      return 'passed';
     return 'retry';
   }
 
@@ -2493,6 +2628,7 @@ class SunoApi {
         document.addEventListener('DOMContentLoaded', hook);
       });
       const page = await context.newPage();
+      await applyChromiumUserAgentOverride(page, this.fingerprint);
       await page.goto(`https://suno.com/song/${clipId}`, {
         referer: 'https://suno.com/',
         waitUntil: 'domcontentloaded',
@@ -2701,6 +2837,7 @@ class SunoApi {
     let closed = false;
     try {
       const page = await context.newPage();
+      await applyChromiumUserAgentOverride(page, this.fingerprint);
       const harvested: { signedUrl?: string; download?: { saveAs: (dest: string) => Promise<void> } } = {};
       const onResponse = async (res: { url: () => string; json: () => Promise<any> }) => {
         if (closed) return;

@@ -170,6 +170,11 @@ function waitMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** PNG IHDR width/height without pulling in an image library. */
+function pngSize(buf: Buffer): { width: number; height: number } {
+  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+}
+
 /**
  * Browser-side drain of audio chunks captured by the MSE appendBuffer hook.
  * Splices new chunks out of the store (store.bytes stays cumulative) and packs
@@ -1755,8 +1760,18 @@ class SunoApi {
           if (signal.aborted)
             throw new Error('AbortError');
           logger.info('Sending the CAPTCHA to 2Captcha');
+          // 2Captcha answers are in screenshot pixels; clicks are in CSS pixels.
+          // Screenshot scale defaults to 'device', which is 2x on the DSF-2
+          // fingerprint — every click would land at double the offset.
+          const shot = await challenge.screenshot({ timeout: 5000, scale: 'css' });
+          const shotBox = await challenge.boundingBox();
+          const dims = pngSize(shot);
+          logger.info(
+            'hCaptcha shot ' + dims.width + 'x' + dims.height
+            + ', container ' + Math.round(shotBox?.width ?? 0) + 'x' + Math.round(shotBox?.height ?? 0)
+          );
           const payload: paramsCoordinates = {
-            body: (await challenge.screenshot({ timeout: 5000 })).toString('base64'),
+            body: shot.toString('base64'),
             lang: captchaWorkerLang()
           };
           if (drag) {

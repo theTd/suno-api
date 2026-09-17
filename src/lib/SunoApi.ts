@@ -1,7 +1,15 @@
 import axios, { AxiosInstance } from 'axios';
 import pino from 'pino';
 import yn from 'yn';
-import { isClosedCdpError, isPage, sleep, waitForRequests } from '@/lib/utils';
+import {
+  hcaptchaOverlayFromBoxes,
+  isClosedCdpError,
+  isPage,
+  sleep,
+  snapshotHcaptchaIframeBoxes,
+  waitForRequests,
+  type HcaptchaOverlayProbe
+} from '@/lib/utils';
 import { CaptchaGate, ClientGoneError } from '@/lib/captcha-gate';
 import { PAGE_FETCH_DEFAULT_TIMEOUT_MS, SunoBrowserSession } from '@/lib/suno-browser-session';
 import {
@@ -778,55 +786,51 @@ class SunoApi {
       await this.warmCreatePage(page);
   }
 
-  /** Checkbox widget is ~300x75; the challenge overlay is much taller. Measured on the parent iframe element — never enter the child frame. */
-  private static readonly HCAPTCHA_CHALLENGE_MIN_WIDTH = 200;
-  private static readonly HCAPTCHA_CHALLENGE_MIN_HEIGHT = 150;
+  private static readonly HCAPTCHA_SNAPSHOT_TIMEOUT_MS = 1000;
+  /** Two 400ms ticks without a challenge-size iframe before treating overlay as gone. */
+  private static readonly HCAPTCHA_GONE_STREAK = 2;
 
-  private hcaptchaWidgetIframes(page: Page): Locator {
-    return page.mainFrame().locator('iframe[title*="hCaptcha"]');
+  /** Challenge overlay only — the checkbox iframe title also contains "hCaptcha". */
+  private hcaptchaChallengeFrame(page: Page) {
+    return page.frameLocator(
+      'iframe[title*="Main content" i], iframe[src*="frame=challenge"]'
+    );
   }
 
-  private async isHcaptchaVisible(page: Page): Promise<boolean> {
-    if (page.isClosed())
-      return false;
-    try {
-      const iframe = this.hcaptchaWidgetIframes(page);
-      if (await iframe.count() === 0)
-        return false;
-      return iframe.first().isVisible().catch(() => false);
-    } catch (err) {
-      if (isClosedCdpError(err))
-        return false;
-      throw err;
-    }
+  private hcaptchaCheckboxFrame(page: Page) {
+    return page.frameLocator('iframe[title*="checkbox" i]');
   }
 
   /**
-   * Whether the challenge overlay iframe is still in the main document.
-   * boundingBox is on the parent <iframe> node — does not createIsolatedWorld
-   * inside the hCaptcha frame (which rebrowser logs and swallows on teardown).
+   * Parent-document getBoundingClientRect of hCaptcha <iframe> nodes.
+   * Does not enter the child frame. null = snapshot failed (unknown).
    */
-  private async isHcaptchaChallengeOpen(page: Page): Promise<boolean> {
+  private async snapshotHcaptchaBoxes(
+    page: Page
+  ): Promise<Array<{ width: number; height: number }> | null> {
     if (page.isClosed())
-      return false;
+      return null;
     try {
-      const iframes = this.hcaptchaWidgetIframes(page);
-      const n = await iframes.count();
-      for (let i = 0; i < n; i++) {
-        const box = await iframes.nth(i).boundingBox().catch(() => null);
-        if (
-          box
-          && box.width >= SunoApi.HCAPTCHA_CHALLENGE_MIN_WIDTH
-          && box.height >= SunoApi.HCAPTCHA_CHALLENGE_MIN_HEIGHT
-        )
-          return true;
-      }
-      return false;
+      return await Promise.race([
+        page.mainFrame().evaluate(snapshotHcaptchaIframeBoxes),
+        waitMs(SunoApi.HCAPTCHA_SNAPSHOT_TIMEOUT_MS).then(() => null)
+      ]);
     } catch (err) {
       if (isClosedCdpError(err))
-        return false;
+        return null;
       throw err;
     }
+  }
+
+  private async probeHcaptchaOverlay(page: Page): Promise<HcaptchaOverlayProbe> {
+    return hcaptchaOverlayFromBoxes(await this.snapshotHcaptchaBoxes(page));
+  }
+
+  private async isHcaptchaVisible(page: Page): Promise<boolean> {
+    const boxes = await this.snapshotHcaptchaBoxes(page);
+    if (!boxes)
+      return false;
+    return boxes.some((box) => box.width > 0 && box.height > 0);
   }
 
   private async waitForHcaptchaChallengeOpen(
@@ -840,11 +844,38 @@ class SunoApi {
         throw new Error('AbortError');
       if (this.captchaTokenCaptured())
         return false;
-      if (await this.isHcaptchaChallengeOpen(page))
+      if (await this.probeHcaptchaOverlay(page) === 'open')
         return true;
       await waitMs(200);
     }
-    return this.captchaTokenCaptured() ? false : await this.isHcaptchaChallengeOpen(page);
+    if (this.captchaTokenCaptured())
+      return false;
+    return (await this.probeHcaptchaOverlay(page)) === 'open';
+  }
+
+  private async overlayConfirmedGone(
+    page: Page,
+    signal: AbortSignal,
+    timeoutMs: number = 800
+  ): Promise<boolean> {
+    let goneStreak = 0;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (signal.aborted)
+        throw new Error('AbortError');
+      if (this.hasCapturedGenerateToken() || this.captchaTokenCaptured())
+        return true;
+      const probe = await this.probeHcaptchaOverlay(page);
+      if (probe === 'open')
+        return false;
+      if (probe === 'gone') {
+        goneStreak++;
+        if (goneStreak >= SunoApi.HCAPTCHA_GONE_STREAK)
+          return true;
+      }
+      await waitMs(400);
+    }
+    return goneStreak >= SunoApi.HCAPTCHA_GONE_STREAK;
   }
 
   /** Create song is on the Suno page, never inside hCaptcha/Turnstile iframes. */
@@ -1357,7 +1388,8 @@ class SunoApi {
     while (Date.now() < deadline) {
       if (signal.aborted || page.isClosed() || this.hasCapturedGenerateToken())
         return;
-      if (!(await this.isHcaptchaVisible(page)))
+      const overlay = await this.probeHcaptchaOverlay(page);
+      if (overlay === 'gone')
         return;
       await waitMs(200);
     }
@@ -1397,6 +1429,19 @@ class SunoApi {
     await this.waitForGenerateTokenOrWidgetGone(page, signal, POST_CAPTCHA_AUTOSUBMIT_MS);
     if (this.hasCapturedGenerateToken())
       return;
+    if (await this.probeHcaptchaOverlay(page) === 'open') {
+      logger.info('hCaptcha overlay still open; waiting instead of clicking Create');
+      if (await this.waitUntilGenerateCaptured(page, signal, POST_CAPTCHA_GENERATE_WAIT_MS))
+        return;
+      if (this.hasCapturedGenerateToken())
+        return;
+      if (await this.probeHcaptchaOverlay(page) === 'open') {
+        const solve = this.activeCaptchaSolve;
+        if (solve && !solve.capturedToken)
+          solve.tokenSettled = true;
+        throw new Error(CAPTCHA_GENERATE_NOT_SUBMITTED);
+      }
+    }
 
     await this.clickCreateSongByMouse(page, 'after captcha pass');
     if (await this.waitUntilGenerateCaptured(page, signal, POST_CAPTCHA_GENERATE_WAIT_MS))
@@ -1633,8 +1678,9 @@ class SunoApi {
     button: Locator,
     signal: AbortSignal
   ): Promise<void> {
-    const frame = page.frameLocator('iframe[title*="hCaptcha"]');
-    const challenge = frame.locator('.challenge-container');
+    const challengeFrame = this.hcaptchaChallengeFrame(page);
+    const checkboxFrame = this.hcaptchaCheckboxFrame(page);
+    const challenge = challengeFrame.locator('.challenge-container');
     const MAX_CAPTCHA_ATTEMPTS = 3;
 
     for (let attempt = 0; attempt < MAX_CAPTCHA_ATTEMPTS; attempt++) {
@@ -1643,24 +1689,35 @@ class SunoApi {
       if (this.captchaTokenCaptured())
         return;
       logger.info(`hCaptcha attempt ${attempt + 1}/${MAX_CAPTCHA_ATTEMPTS}`);
-      const visible = await this.isHcaptchaChallengeOpen(page);
-      if (!visible) {
-        if (attempt > 0 || this.captchaTokenCaptured() || !(await this.isHcaptchaVisible(page))) {
+      let overlay = await this.probeHcaptchaOverlay(page);
+      if (overlay !== 'open') {
+        if (this.hasCapturedGenerateToken() || this.captchaTokenCaptured())
+          return;
+        if (attempt > 0 && overlay === 'unknown') {
+          // Probe failed right after submit — confirm gone before deciding.
+          if (await this.overlayConfirmedGone(page, signal, 1200))
+            overlay = 'gone';
+          else
+            overlay = await this.probeHcaptchaOverlay(page);
+        }
+        if (overlay === 'gone') {
           logger.info('hCaptcha challenge gone after previous submit');
           return;
         }
-        logger.info('hCaptcha challenge not open; clicking checkbox');
-        const checkbox = frame.locator('#checkbox, .checkbox');
-        await checkbox.first().click({ timeout: 8000 }).catch((e: any) => {
-          logger.info('hCaptcha checkbox click failed: ' + e.message);
-        });
-        const opened = await this.waitForHcaptchaChallengeOpen(page, signal, 15000);
-        if (this.captchaTokenCaptured())
-          return;
-        if (!opened) {
-          if (!(await this.isHcaptchaVisible(page)))
+        if (overlay !== 'open') {
+          logger.info('hCaptcha challenge not open; clicking checkbox');
+          const checkbox = checkboxFrame.locator('#checkbox, .checkbox');
+          await checkbox.first().click({ timeout: 8000 }).catch((e: any) => {
+            logger.info('hCaptcha checkbox click failed: ' + e.message);
+          });
+          const opened = await this.waitForHcaptchaChallengeOpen(page, signal, 15000);
+          if (this.captchaTokenCaptured())
             return;
-          throw new Error('hCaptcha challenge did not open within 15s');
+          if (!opened) {
+            if (!(await this.isHcaptchaVisible(page)))
+              return;
+            throw new Error('hCaptcha challenge did not open within 15s');
+          }
         }
       }
       if (attempt === 0) {
@@ -1760,15 +1817,24 @@ class SunoApi {
       }
 
       try {
-        await this.click(frame.locator('.button-submit'));
+        await this.click(challengeFrame.locator('.button-submit'));
       } catch (e: any) {
         if (e.message.includes('viewport')) {
           await this.click(button);
-        } else if (this.captchaTokenCaptured() || !(await this.isHcaptchaChallengeOpen(page))) {
+        } else if (this.hasCapturedGenerateToken()) {
           logger.info('hCaptcha submit skipped; challenge already closed');
           return;
         } else {
-          throw e;
+          const afterClick = await this.probeHcaptchaOverlay(page);
+          if (afterClick === 'gone') {
+            logger.info('hCaptcha submit skipped; challenge already closed');
+            return;
+          }
+          if (afterClick === 'unknown') {
+            logger.info('hCaptcha submit click failed during overlay probe unknown');
+          } else {
+            throw e;
+          }
         }
       }
 
@@ -1780,8 +1846,12 @@ class SunoApi {
       logger.info('hCaptcha still visible after submit; retrying');
     }
 
-    if (this.captchaTokenCaptured())
+    if (this.hasCapturedGenerateToken() || this.captchaTokenCaptured())
       return;
+    if (await this.overlayConfirmedGone(page, signal, 800)) {
+      logger.info('hCaptcha overlay gone after max attempts; treating as passed');
+      return;
+    }
     throw new Error('hCaptcha max attempts exceeded');
   }
 
@@ -1799,16 +1869,25 @@ class SunoApi {
     timeoutMs: number
   ): Promise<'passed' | 'retry'> {
     const deadline = Date.now() + timeoutMs;
+    let goneStreak = 0;
     while (Date.now() < deadline) {
       if (signal.aborted)
         throw new Error('AbortError');
-      if (this.captchaTokenCaptured())
+      if (this.hasCapturedGenerateToken() || this.captchaTokenCaptured())
         return 'passed';
-      if (!(await this.isHcaptchaChallengeOpen(page)))
-        return 'passed';
-      await sleep(0.4, 0.4);
+      const overlay = await this.probeHcaptchaOverlay(page);
+      if (overlay === 'open')
+        goneStreak = 0;
+      else if (overlay === 'gone') {
+        goneStreak++;
+        if (goneStreak >= SunoApi.HCAPTCHA_GONE_STREAK)
+          return 'passed';
+      }
+      await waitMs(400);
     }
-    if (this.captchaTokenCaptured() || !(await this.isHcaptchaChallengeOpen(page)))
+    if (this.hasCapturedGenerateToken() || this.captchaTokenCaptured())
+      return 'passed';
+    if (goneStreak >= SunoApi.HCAPTCHA_GONE_STREAK)
       return 'passed';
     return 'retry';
   }

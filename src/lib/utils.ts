@@ -39,6 +39,43 @@ export function isClosedCdpError(err: unknown): boolean {
   return /session closed|Target closed|Execution context was destroyed|frame was detached|has been closed|Cannot find context|createIsolatedWorld|cannot get world/i.test(message);
 }
 
+/** Checkbox widget is ~300x75; the challenge overlay is much taller. */
+export const HCAPTCHA_CHALLENGE_MIN_WIDTH = 200;
+export const HCAPTCHA_CHALLENGE_MIN_HEIGHT = 150;
+
+export function isHcaptchaChallengeBox(
+  box: { width: number; height: number } | null | undefined
+): boolean {
+  return !!box
+    && box.width >= HCAPTCHA_CHALLENGE_MIN_WIDTH
+    && box.height >= HCAPTCHA_CHALLENGE_MIN_HEIGHT;
+}
+
+export type HcaptchaOverlayProbe = 'open' | 'gone' | 'unknown';
+
+/**
+ * Parent-document iframe boxes only. `null` means the snapshot failed
+ * (timeout / closed session) — that is unknown, not gone.
+ */
+export function hcaptchaOverlayFromBoxes(
+  boxes: Array<{ width: number; height: number }> | null | undefined
+): HcaptchaOverlayProbe {
+  if (!boxes)
+    return 'unknown';
+  return boxes.some((box) => isHcaptchaChallengeBox(box)) ? 'open' : 'gone';
+}
+
+/** Runs in the page. Must stay self-contained. */
+export function snapshotHcaptchaIframeBoxes(): Array<{ width: number; height: number }> {
+  const nodes = document.querySelectorAll('iframe[title*="hCaptcha"]');
+  const boxes: Array<{ width: number; height: number }> = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const rect = nodes[i].getBoundingClientRect();
+    boxes.push({ width: rect.width, height: rect.height });
+  }
+  return boxes;
+}
+
 export const HCAPTCHA_ASSET_URL =
   /^https:\/\/(img[a-zA-Z0-9]*\.hcaptcha\.com|hcaptcha-assets-prod\.suno\.com|hcaptcha-imgs-prod\.suno\.com)\/.*$/;
 

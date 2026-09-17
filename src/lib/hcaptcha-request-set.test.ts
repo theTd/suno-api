@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { isClosedCdpError, StartedRequestSet } from './utils';
+import {
+  hcaptchaOverlayFromBoxes,
+  isClosedCdpError,
+  isHcaptchaChallengeBox,
+  StartedRequestSet
+} from './utils';
 
 test('StartedRequestSet ignores finishes for requests it never saw start', () => {
   const set = new StartedRequestSet();
@@ -40,4 +45,23 @@ test('isClosedCdpError matches rebrowser isolated-world teardown', () => {
   assert.equal(isClosedCdpError({ message: 'Target closed' }), true);
   assert.equal(isClosedCdpError({ message: 'frame was detached' }), true);
   assert.equal(isClosedCdpError({ message: 'hCaptcha challenge did not open within 15s' }), false);
+});
+
+test('isHcaptchaChallengeBox distinguishes overlay from checkbox', () => {
+  assert.equal(isHcaptchaChallengeBox(null), false);
+  assert.equal(isHcaptchaChallengeBox({ width: 303, height: 78 }), false);
+  assert.equal(isHcaptchaChallengeBox({ width: 400, height: 600 }), true);
+  assert.equal(isHcaptchaChallengeBox({ width: 200, height: 150 }), true);
+});
+
+test('hcaptchaOverlayFromBoxes treats a failed snapshot as unknown, not gone', () => {
+  assert.equal(hcaptchaOverlayFromBoxes(null), 'unknown');
+  assert.equal(hcaptchaOverlayFromBoxes(undefined), 'unknown');
+  assert.equal(hcaptchaOverlayFromBoxes([]), 'gone');
+  assert.equal(hcaptchaOverlayFromBoxes([{ width: 303, height: 78 }]), 'gone');
+  assert.equal(hcaptchaOverlayFromBoxes([{ width: 400, height: 600 }]), 'open');
+  assert.equal(
+    hcaptchaOverlayFromBoxes([{ width: 303, height: 78 }, { width: 400, height: 600 }]),
+    'open'
+  );
 });

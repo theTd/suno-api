@@ -13,6 +13,15 @@ import {
 import { CaptchaGate, ClientGoneError } from '@/lib/captcha-gate';
 import { PAGE_FETCH_DEFAULT_TIMEOUT_MS, SunoBrowserSession } from '@/lib/suno-browser-session';
 import {
+  captchaSolverClickTarget,
+  captchaTriggerPrompt,
+  CREATE_WIDGET_WAIT_MS,
+  isVerifiedSessionFresh,
+  shouldClickHomepageCreateFallback,
+  shouldReloadCreatePage,
+  studioWebApiHeaders
+} from '@/lib/suno-captcha-policy';
+import {
   applyChromiumUserAgentOverride,
   applyStealthInit,
   buildChromeMacFingerprint,
@@ -488,6 +497,8 @@ class SunoApi {
   private fingerprint: ChromeMacFingerprint = buildChromeMacFingerprint();
   private browserSessionStartedAt = 0;
   private captchaSolveCount = 0;
+  /** Last time /api/c/check was clean or a captcha-backed generate was accepted. */
+  private lastCaptchaPassAt = 0;
   private ghostCursorEnabled = yn(process.env.BROWSER_GHOST_CURSOR, { default: false });
   private cursor?: Cursor;
   private feedListCache?: { key: string; at: number; data: AudioInfo[] };
@@ -518,17 +529,18 @@ class SunoApi {
     this.client = axios.create({
       withCredentials: true,
       headers: {
-        'Affiliate-Id': 'undefined',
-        'Device-Id': `"${this.deviceId}"`,
-        'x-suno-client': 'suno-web',
-        ...fingerprintHttpHeaders(this.fingerprint)
+        ...fingerprintHttpHeaders(this.fingerprint),
+        ...studioWebApiHeaders(undefined, this.deviceId || '')
       }
     });
     this.client.interceptors.request.use(config => {
       if (this.currentToken && !config.headers.Authorization)
         config.headers.Authorization = `Bearer ${this.currentToken}`;
-      Object.assign(config.headers, fingerprintHttpHeaders(this.fingerprint));
-      config.headers['x-suno-client'] = 'suno-web';
+      Object.assign(
+        config.headers,
+        fingerprintHttpHeaders(this.fingerprint),
+        studioWebApiHeaders(undefined, this.deviceId || '')
+      );
       const cookiesArray = Object.entries(this.cookies).map(([key, value]) => 
         cookie.serialize(key, value as string)
       );
@@ -623,6 +635,20 @@ class SunoApi {
         return;
       }
     }
+    if (this.browserSession.isAlive()) {
+      try {
+        const token = await this.browserSession.getClerkToken();
+        if (token) {
+          this.currentToken = token;
+          logger.info('KeepAlive from Chromium Clerk session');
+          if (isWait)
+            await sleep(1, 2);
+          return;
+        }
+      } catch (err: any) {
+        logger.warn('In-page Clerk token failed; falling back to axios: ' + err.message);
+      }
+    }
     // URL to renew session token
     const renewUrl = `${SunoApi.CLERK_BASE_URL}/v1/client/sessions/${this.sid}/tokens?__clerk_api_version=2025-11-10&_clerk_js_version=${SunoApi.CLERK_VERSION}`;
     // Renew session token
@@ -689,13 +715,7 @@ class SunoApi {
     const token = await this.browserSession.getClerkToken(locked);
     if (token)
       this.currentToken = token;
-    const headers: Record<string, string> = {
-      'content-type': 'application/json',
-      'x-suno-client': 'suno-web'
-    };
-    if (token)
-      headers.Authorization = `Bearer ${token}`;
-    return headers;
+    return studioWebApiHeaders(token, this.deviceId || '');
   }
 
   private async syncAuthFromBrowser(): Promise<void> {
@@ -707,6 +727,8 @@ class SunoApi {
       if (item.name && item.value)
         this.cookies[item.name] = item.value;
     }
+    if (this.cookies.ajs_anonymous_id)
+      this.deviceId = this.cookies.ajs_anonymous_id;
   }
 
   private async ensureGeneratePage(signal?: AbortSignal): Promise<Page> {
@@ -735,6 +757,7 @@ class SunoApi {
     if (newBrowser) {
       this.browserSessionStartedAt = Date.now();
       this.captchaSolveCount = 0;
+      this.lastCaptchaPassAt = 0;
       logger.info('Launching browser... (new session)');
     }
     else if (!reused)
@@ -749,10 +772,11 @@ class SunoApi {
 
     await this.browserSession.withWrite(async () => {
       if (reused)
-        await this.ensureOnCreatePage(page, false);
+        await this.ensureOnCreatePage(page);
       else
         await this.warmCreatePage(page);
     });
+    await this.syncAuthFromBrowser();
     return page;
   }
 
@@ -774,21 +798,44 @@ class SunoApi {
     await this.dismissOverlays(page);
   }
 
-  private async ensureOnCreatePage(page: Page, resetWidget = false): Promise<void> {
+  private async ensureOnCreatePage(page: Page): Promise<void> {
     if (page.isClosed())
       throw new Error('Chromium session page is closed');
-    const widgetUp = resetWidget
-      && ((await this.isTurnstileVisible(page)) || (await this.isHcaptchaVisible(page)));
     const onCreate = /suno\.com\/create/.test(page.url());
-    if (!onCreate || widgetUp) {
+    const textareaVisible = onCreate
+      ? await page.locator('textarea').first().isVisible().catch(() => false)
+      : false;
+    if (shouldReloadCreatePage({ onCreate, challengeOpen: false, textareaVisible })) {
       logger.info('Resetting Chromium session to /create');
       await this.warmCreatePage(page);
       return;
     }
     await this.dismissOverlays(page);
-    const visible = await page.locator('textarea').first().isVisible().catch(() => false);
-    if (!visible)
+  }
+
+  /**
+   * After a solve, keep the /create document so the hCaptcha pass can be reused.
+   * Only navigate when the editor is gone or the image challenge is stuck.
+   * A just-accepted generate must not reload because the overlay is still closing.
+   */
+  private async settleCreatePageAfterSolve(page: Page, generateAccepted: boolean): Promise<void> {
+    if (page.isClosed())
+      return;
+    const onCreate = /suno\.com\/create/.test(page.url());
+    const challengeOpen = (await this.probeHcaptchaOverlay(page)) === 'open';
+    const textareaVisible = onCreate
+      ? await page.locator('textarea').first().isVisible().catch(() => false)
+      : false;
+    if (shouldReloadCreatePage({ onCreate, challengeOpen, textareaVisible, generateAccepted })) {
+      logger.info('Resetting Chromium session to /create');
       await this.warmCreatePage(page);
+      return;
+    }
+    await this.dismissOverlays(page);
+  }
+
+  private markVerifiedSession(): void {
+    this.lastCaptchaPassAt = Date.now();
   }
 
   private static readonly HCAPTCHA_SNAPSHOT_TIMEOUT_MS = 1000;
@@ -1029,6 +1076,7 @@ class SunoApi {
     await this.browserSession.invalidate().catch(() => {});
     this.captchaSolveCount = 0;
     this.browserSessionStartedAt = 0;
+    this.lastCaptchaPassAt = 0;
   }
 
   private async ensureGenerateRoute(page: Page): Promise<void> {
@@ -1154,14 +1202,19 @@ class SunoApi {
     this.captchaTransactionUuid = undefined;
     this.captchaBrowserClips = undefined;
     this.captchaBrowserError = undefined;
-    if (!await this.captchaRequired(signal))
+    if (!await this.captchaRequired(signal)) {
+      this.markVerifiedSession();
       return null;
+    }
 
     // Becoming the solver engages the per-account soft lock so concurrent
     // requests queue up instead of each launching their own browser + 2Captcha solve.
     engage();
     this.captchaSolveCount++;
-    logger.info('CAPTCHA required. Using Chromium session...');
+    if (isVerifiedSessionFresh(this.lastCaptchaPassAt))
+      logger.info('CAPTCHA required; reusing Chromium hCaptcha session (no page reload)');
+    else
+      logger.info('CAPTCHA required. Using Chromium session...');
     const page = await this.ensureGeneratePage(signal);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 300000);
@@ -1177,11 +1230,10 @@ class SunoApi {
 
       const textarea = page.mainFrame().locator('textarea').first();
       await this.click(textarea);
-      await textarea.fill('Lorem ipsum');
+      await textarea.fill(captchaTriggerPrompt(submitOptions?.prompt));
+      await sleep(0.8, 1.6);
 
-      const createSong = this.createSongButton(page);
       const homepageCreate = page.mainFrame().locator('button:has-text("Create")').first();
-      const button = (await createSong.count()) > 0 ? createSong.first() : homepageCreate;
 
       const tokenPromise = new Promise<string>((resolve, reject) => {
         this.activeCaptchaSolve = {
@@ -1201,15 +1253,22 @@ class SunoApi {
       });
 
       await this.triggerCreateOnCreatePage(page);
-      if (!(await this.isTurnstileVisible(page)) && !(await this.isHcaptchaVisible(page))) {
-        const homepageCreateVisible = await homepageCreate.isVisible().catch(() => false);
-        if (homepageCreateVisible && await homepageCreate.isEnabled().catch(() => false)) {
-          logger.info('Clicking homepage Create as fallback');
-          await this.click(homepageCreate);
+      const engaged = await this.waitForCaptchaEngage(page, controller.signal, CREATE_WIDGET_WAIT_MS);
+      if (!engaged && !this.captchaTokenCaptured()) {
+        const onCreate = /suno\.com\/create/.test(page.url());
+        if (shouldClickHomepageCreateFallback({ onCreate, widgetOrToken: false })) {
+          const homepageCreateVisible = await homepageCreate.isVisible().catch(() => false);
+          if (homepageCreateVisible && await homepageCreate.isEnabled().catch(() => false)) {
+            logger.info('Clicking homepage Create as fallback');
+            await this.click(homepageCreate);
+          }
+        } else if (onCreate) {
+          logger.info('Retrying Create song after widget wait');
+          await this.triggerCreateOnCreatePage(page);
         }
       }
 
-      const captchaPromise = this.solveDetectedCaptcha(page, button, controller.signal)
+      const captchaPromise = this.solveDetectedCaptcha(page, controller.signal)
         .then(() => ({ type: 'solved' as const }))
         .catch((err: any) => ({ type: 'solver_failed' as const, err }));
       // Consume tokenPromise rejection so abort during the post-pass wait
@@ -1271,8 +1330,10 @@ class SunoApi {
           `age=${ageMin}m solves=${this.captchaSolveCount}`
         );
       } else if (this.browserSession.isAlive()) {
-        await this.browserSession.withWrite(() => this.ensureOnCreatePage(page, true)).catch((e: any) => {
-          logger.info('Post-captcha /create reset failed: ' + e.message);
+        await this.browserSession.withWrite(
+          () => this.settleCreatePageAfterSolve(page, !!this.captchaBrowserClips)
+        ).catch((e: any) => {
+          logger.info('Post-captcha /create settle failed: ' + e.message);
         });
       }
     }
@@ -1504,6 +1565,26 @@ class SunoApi {
     }
   }
 
+  private async waitForCaptchaEngage(
+    page: Page,
+    signal: AbortSignal,
+    timeoutMs: number
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (signal.aborted)
+        throw new ClientGoneError();
+      if (this.captchaTokenCaptured())
+        return true;
+      if (await this.isTurnstileVisible(page) || await this.isHcaptchaVisible(page))
+        return true;
+      await waitMs(200);
+    }
+    return this.captchaTokenCaptured()
+      || await this.isTurnstileVisible(page)
+      || await this.isHcaptchaVisible(page);
+  }
+
   private async clickCreateSongByMouse(page: Page, reason: string): Promise<void> {
     if (page.isClosed() || this.hasCapturedGenerateToken())
       return;
@@ -1549,7 +1630,6 @@ class SunoApi {
 
   private async solveDetectedCaptcha(
     page: Page,
-    button: Locator,
     signal: AbortSignal
   ): Promise<void> {
     const kind = await this.waitForCaptchaKind(page, signal);
@@ -1559,9 +1639,20 @@ class SunoApi {
     if (kind === 'turnstile')
       await this.solveTurnstileChallenge(page, signal);
     else if (kind === 'hcaptcha')
-      await this.solveHcaptchaChallenge(page, button, signal);
+      await this.solveHcaptchaChallenge(page, signal);
     else
       throw new Error('CAPTCHA required but no widget appeared');
+  }
+
+  private async captchaSolverButton(page: Page): Promise<Locator> {
+    const createSong = this.createSongButton(page);
+    const target = captchaSolverClickTarget({
+      onCreate: /suno\.com\/create/.test(page.url()),
+      createSongAvailable: (await createSong.count()) > 0
+    });
+    if (target === 'create-song')
+      return createSong.first();
+    return page.mainFrame().locator('button:has-text("Create")').first();
   }
 
   private async waitForCaptchaKind(
@@ -1680,7 +1771,6 @@ class SunoApi {
 
   private async solveHcaptchaChallenge(
     page: Page,
-    button: Locator,
     signal: AbortSignal
   ): Promise<void> {
     const challengeFrame = this.hcaptchaChallengeFrame(page);
@@ -1847,7 +1937,7 @@ class SunoApi {
         await this.click(challengeFrame.locator('.button-submit'));
       } catch (e: any) {
         if (e.message.includes('viewport')) {
-          await this.click(button);
+          await this.click(await this.captchaSolverButton(page));
         } else if (this.hasCapturedGenerateToken()) {
           logger.info('hCaptcha submit skipped; challenge already closed');
           return;
@@ -2041,6 +2131,7 @@ class SunoApi {
       try {
         const captchaToken = await this.getCaptcha(engage, options.signal, options);
         if (this.captchaBrowserClips) {
+          this.markVerifiedSession();
           this.invalidateFeedListCache();
           await this.syncAuthFromBrowser();
           return this.captchaBrowserClips;
@@ -2050,6 +2141,7 @@ class SunoApi {
         if (captchaToken)
           throw new Error('Captcha token captured but browser generate did not complete');
         const created = await this.postGenerateViaPage({ ...options, captchaToken: null });
+        this.markVerifiedSession();
         await this.syncAuthFromBrowser();
         return created;
       } catch (e) {

@@ -342,6 +342,20 @@ function jwtRemainingMs(token?: string): number | undefined {
 }
 
 /**
+ * Title-cases a sound prompt the way the official Sounds tab does, capped at
+ * 80 chars: longer titles are cut mid-word at 77 chars plus '...'.
+ * Measured from the web client (an 84-char prompt is stored as 80 chars).
+ */
+export function formatSoundTitle(prompt: string): string {
+  const titleCased = prompt
+    .split(/\s+/)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ')
+    .replace(/\s+$/, '');
+  return titleCased.length > 80 ? titleCased.slice(0, 77) + '...' : titleCased;
+}
+
+/**
  * Builds the official POST /api/generate/v2-web/ request body.
  * Pure function; every rule here was measured from the Suno web client.
  */
@@ -2389,13 +2403,8 @@ class SunoApi {
     extras?: GenerationExtras
   ): Promise<AudioInfo[]> {
     const startTime = Date.now();
-    // Title is title-cased and truncated to ~100 chars to match official web behavior
-    const title = prompt
-      .split(/\s+/)
-      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-      .join(' ')
-      .slice(0, 100)
-      .replace(/\s+$/, '');
+    // Title follows the official web client (see formatSoundTitle).
+    const title = formatSoundTitle(prompt);
     const audios = await this.generateSongs({
       prompt,
       isCustom: true,

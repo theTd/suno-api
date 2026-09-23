@@ -7,7 +7,7 @@ import {
   SUNO_MODELS
 } from './suno-models';
 import { parseSoundKey, parseSoundTempo, SOUND_KEY_HINT } from './generation-options';
-import { buildGenerateV2Payload } from './SunoApi';
+import { buildGenerateV2Payload, formatSoundTitle } from './SunoApi';
 
 test('model catalog matches the official /create menu (v6, v6-wild, v6-mini)', () => {
   assert.equal(SUNO_MODELS.length, 3);
@@ -115,4 +115,23 @@ test('song payload keeps control sliders and lyrics model', () => {
   assert.deepEqual(payload.metadata.control_sliders, { aug_creativity: 1 });
   assert.equal(payload.metadata.lyrics_model, 'default');
   assert.ok(!('task' in payload));
+});
+
+test('formatSoundTitle matches the official 80-char cap (77 + ...)', () => {
+  assert.equal(
+    formatSoundTitle('hollow wooden knock, single hit, dry room'),
+    'Hollow Wooden Knock, Single Hit, Dry Room'
+  );
+  const long = formatSoundTitle(
+    'small metal paperclip drop onto a ceramic plate, short one-shot, close mic, no music'
+  );
+  assert.equal(long.length, 80);
+  assert.equal(
+    long,
+    'Small Metal Paperclip Drop Onto A Ceramic Plate, Short One-shot, Close Mic, N...'
+  );
+  const eighty = 'a'.repeat(80);
+  assert.equal(formatSoundTitle(eighty).length, 80);
+  assert.equal(formatSoundTitle(eighty + 'b').length, 80);
+  assert.ok(formatSoundTitle(eighty + 'b').endsWith('...'));
 });

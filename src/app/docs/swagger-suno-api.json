@@ -380,7 +380,7 @@
                   "model": {
                     "type": "string",
                     "description": "Model name, default is chirp-hawk",
-                    "example": "chirp-hawk"
+                    "example": "chirp-hawk|chirp-hawk-wild|chirp-goose"
                   },
                   "tempo": {
                     "type": "number",
@@ -389,7 +389,7 @@
                   },
                   "key": {
                     "type": "string",
-                    "description": "Musical key of the generated sound effect, e.g. 'C', 'F#' or 'A#m' (m = minor). Omit for any key.",
+                    "description": "Musical key from the official Key picker: C, C#, D, D#, E, F, F#, G, G#, A, A#, B, each optionally followed by 'm' for minor. Omit for Any.",
                     "example": "C"
                   },
                   "wait_audio": {
@@ -563,6 +563,87 @@
                     "monthly_usage": {
                       "type": "number",
                       "description": "Monthly usage"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/models": {
+      "get": {
+        "summary": "List generation models.",
+        "description": "Models offered by the official Suno web client (v6 / v6-wild / v6-mini) with tiers, descriptions and per-tab defaults. Model ids are accepted by the `model` argument of the generate endpoints.",
+        "tags": ["default"],
+        "responses": {
+          "200": {
+            "description": "success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "default_model",
+                    "models",
+                    "note"
+                  ],
+                  "properties": {
+                    "default_model": {
+                      "type": "string",
+                      "description": "Model id used when the generate endpoints get no `model` argument.",
+                      "example": "chirp-hawk"
+                    },
+                    "models": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id",
+                          "label",
+                          "tier",
+                          "description",
+                          "default_for",
+                          "supports_sound"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "description": "The `mv` / `model` value, e.g. chirp-hawk.",
+                            "example": "chirp-hawk"
+                          },
+                          "label": {
+                            "type": "string",
+                            "description": "Label shown in the official model menu, e.g. v6.",
+                            "example": "v6"
+                          },
+                          "tier": {
+                            "type": "string",
+                            "description": "pro or free.",
+                            "example": "pro"
+                          },
+                          "description": {
+                            "type": "string",
+                            "description": "Description shown in the official model menu."
+                          },
+                          "default_for": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "Which /create tabs preselect this model (simple, advanced, sounds)."
+                          },
+                          "supports_sound": {
+                            "type": "boolean",
+                            "description": "Whether the model is offered for sound-effect generation."
+                          }
+                        }
+                      }
+                    },
+                    "note": {
+                      "type": "string",
+                      "description": "Acceptance rules for model ids and the meaning of default_model vs default_for."
                     }
                   }
                 }

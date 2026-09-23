@@ -6,7 +6,8 @@ import { InMemoryTaskStore, InMemoryTaskMessageQueue } from "@modelcontextprotoc
 import { z } from "zod/v4";
 import { ClipAudioNotReadyError, DEFAULT_MODEL, isUnusableAudioUrl, rewriteForbiddenAudioUrls, sunoApi } from "./SunoApi";
 import type { PreviewJobSnapshot } from "./SunoApi";
-import { parseGenerationExtras } from "./generation-options";
+import { parseGenerationExtras, SOUND_KEY_HINT, SOUND_KEY_PATTERN } from "./generation-options";
+import { listSunoModels } from "./suno-models";
 import { publicOriginFromEnv } from "./public-origin";
 import { hasUnlockConsent } from "./unlock-consent";
 
@@ -398,7 +399,9 @@ function registerTaskTool(
 // ─── Schema Constants (reused by sync + task tools) ──────────────────
 
 const MODEL_DESCRIPTION =
-  "Model name to use for generation: 'chirp-hawk' (v6, default), 'chirp-hawk-wild' (v6-wild), 'chirp-goose' (v6-mini), or a custom model id";
+  "Model `mv` id to use for generation (e.g. 'chirp-hawk' for v6). " +
+  "Call list_models for the full catalog with tiers and per-tab defaults. " +
+  "Custom model ids from Create Custom Model (Beta) are also accepted.";
 
 const EXTRAS_SCHEMA_FIELDS = {
   weirdness: z.number().min(0).max(100).optional()
@@ -449,7 +452,7 @@ const EXTEND_AUDIO_SCHEMA = {
   tags: z.string().optional().describe("Style tags for the extension"),
   negative_tags: z.string().optional().describe("Tags to exclude"),
   title: z.string().optional().describe("Title of the song"),
-  model: z.string().optional().describe("Model name (default: chirp-hawk)"),
+  model: z.string().optional().describe(MODEL_DESCRIPTION),
 };
 
 const GENERATE_SOUND_SCHEMA = {
@@ -458,7 +461,7 @@ const GENERATE_SOUND_SCHEMA = {
   model: z.string().optional().describe(MODEL_DESCRIPTION),
   wait_audio: z.boolean().default(true).describe("Defaults to true. Wait until clips are ready and embed playable audio bytes (SFX). Set false to return clip ids immediately."),
   tempo: z.number().int().min(1).max(300).optional().describe("BPM of the generated sound effect (1-300). Omit for auto."),
-  key: z.string().regex(/^[A-G]#?m?$/).optional().describe("Musical key, e.g. 'C', 'F#' or 'A#m' (m = minor). Omit for any key."),
+  key: z.string().refine((v) => SOUND_KEY_PATTERN.test(v), { message: `key must be one of ${SOUND_KEY_HINT}` }).optional().describe("Musical key from the official Key picker (C, C#, D, D#, E, F, F#, G, G#, A, A#, B, optionally + 'm' for minor). Omit for Any."),
 };
 
 // ─── Server Factory ──────────────────────────────────────────────────
@@ -482,7 +485,8 @@ export function createMcpServer(): McpServer {
         "generate_custom_music takes full LYRICS in `prompt`, with style/genre in `tags` and a `title` (all three required). " +
         "Use generate_sound for sound effects, extend_audio to extend existing clips, " +
         "or the query tools (get_audio_info, get_account_limit) for read-only operations. " +
-        "Do NOT call download_audio or download_audio_file until the user has clicked 「解锁母带」 on /mcp/preview for that clip.",
+        "Do NOT call download_audio or download_audio_file until the user has clicked 「解锁母带」 on /mcp/preview for that clip. " +
+        "Call list_models to see the available generation models with tiers and defaults.",
       taskStore,
       taskMessageQueue: new InMemoryTaskMessageQueue(),
       defaultTaskPollInterval: 5000,
@@ -658,6 +662,23 @@ export function createMcpServer(): McpServer {
       const api = await sunoApi(cookies);
       const result = await api.get_credits();
       return buildToolResult(result, { sessionId: extra.sessionId });
+    }
+  );
+
+  // ─── Tool 7b: list_models ─────────────────────────────────────────
+  server.registerTool(
+    "list_models",
+    {
+      title: "List Models",
+      description:
+        "List the generation models offered by the official Suno web client " +
+        "(v6 / v6-wild / v6-mini with tiers, descriptions and per-tab defaults). " +
+        "Model ids are accepted by the `model` argument of all generation tools.",
+      inputSchema: {},
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async () => {
+      return buildToolResult({ default_model: DEFAULT_MODEL, models: listSunoModels() });
     }
   );
 

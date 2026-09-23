@@ -49,6 +49,9 @@ import { Readable } from 'stream';
 import path from 'node:path';
 import os from 'node:os';
 import { emitPreviewLiveEvent } from '@/lib/preview-live/preview-live-events';
+import { DEFAULT_MODEL } from '@/lib/suno-models';
+
+export { DEFAULT_MODEL };
 
 // sunoApi instance caching
 const globalForSunoApi = global as unknown as { sunoApiCache?: Map<string, SunoApi> };
@@ -56,7 +59,6 @@ const cache = globalForSunoApi.sunoApiCache || new Map<string, SunoApi>();
 globalForSunoApi.sunoApiCache = cache;
 
 const logger = pino();
-export const DEFAULT_MODEL = 'chirp-hawk';
 const AUDIO_CACHE_DIR = path.join(os.tmpdir(), 'suno-audio-cache');
 const PREVIEW_CACHE_DIR = path.join(os.tmpdir(), 'suno-preview-cache');
 // How long a background preview job waits for the clip to become ready.
@@ -348,13 +350,19 @@ export function buildGenerateV2Payload(options: GenerateSongsOptions, ctx: Gener
   validateGenerationExtras(extras);
 
   const isSound = options.task === 'sound';
-  const controlSliders: Record<string, number> = {
-    aug_creativity: extras.variety ?? 1
-  };
-  if (extras.weirdness !== undefined && extras.weirdness !== 50)
-    controlSliders.weirdness_constraint = extras.weirdness / 100;
-  if (extras.style_influence !== undefined && extras.style_influence !== 50)
-    controlSliders.style_weight = extras.style_influence / 100;
+  // Measured from the web client: song generations carry control sliders and
+  // a lyrics model, while the Sounds tab sends neither.
+  const controlSliders: Record<string, number> | undefined = isSound
+    ? undefined
+    : {
+      aug_creativity: extras.variety ?? 1
+    };
+  if (controlSliders) {
+    if (extras.weirdness !== undefined && extras.weirdness !== 50)
+      controlSliders.weirdness_constraint = extras.weirdness / 100;
+    if (extras.style_influence !== undefined && extras.style_influence !== 50)
+      controlSliders.style_weight = extras.style_influence / 100;
+  }
 
   const payload: any = {
     token: ctx.captchaToken ?? null,
@@ -371,8 +379,7 @@ export function buildGenerateV2Payload(options: GenerateSongsOptions, ctx: Gener
       is_mumble: false,
       create_mode: options.isCustom ? 'custom' : 'simple',
       disable_volume_normalization: false,
-      control_sliders: controlSliders,
-      lyrics_model: 'default'
+      ...(controlSliders ? { control_sliders: controlSliders, lyrics_model: 'default' } : {})
     },
     override_fields: [],
     cover_clip_id: null,
@@ -388,7 +395,8 @@ export function buildGenerateV2Payload(options: GenerateSongsOptions, ctx: Gener
     transaction_uuid: ctx.transactionUuid || randomUUID(),
     token_provider: ctx.captchaTokenProvider ?? null
   };
-  // The official client only sends `task` for non-custom generations.
+  // `task` rides alongside `create_mode: custom` — measured on the Sounds
+  // tab, which sends task 'sound' with custom mode.
   if (options.task)
     payload.task = options.task;
   if (ctx.userTier)

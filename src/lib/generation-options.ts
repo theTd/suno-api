@@ -65,11 +65,20 @@ export function parseSoundTempo(input: unknown): number | undefined {
   return tempo;
 }
 
+/**
+ * Musical keys the official Sounds-tab Key picker can produce: natural and
+ * sharp roots (there is no E# / B#) with an optional minor 'm' suffix.
+ * 'Any' in the UI means unset, which is the undefined return here.
+ */
+export const SOUND_KEY_PATTERN = /^(C#?|D#?|E|F#?|G#?|A#?|B)m?$/;
+
+export const SOUND_KEY_HINT = "C, C#, D, D#, E, F, F#, G, G#, A, A#, B, each optionally followed by 'm' for minor";
+
 /** Validates an optional musical key ('C', 'F#', 'A#m'; undefined when unset). */
 export function parseSoundKey(input: unknown): string | undefined {
   if (input === undefined || input === null || input === '') return undefined;
   const key = String(input).trim();
-  if (!/^[A-G]#?m?$/.test(key))
-    throw new Error(`key must look like 'C', 'F#' or 'A#m', got ${JSON.stringify(input)}`);
+  if (!SOUND_KEY_PATTERN.test(key))
+    throw new Error(`key must be one of ${SOUND_KEY_HINT}, got ${JSON.stringify(input)}`);
   return key;
 }

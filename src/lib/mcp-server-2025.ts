@@ -138,16 +138,16 @@ async function buildToolResult(
       );
       const harvested = new Map<
         string,
-        { buffer: Buffer; contentType: string } | { job: PreviewJobSnapshot }
+        { buffer: Buffer; contentType: string; transcoded?: boolean } | { job: PreviewJobSnapshot }
       >();
       if (opts?.embedAudio && opts.api && readyClips.length > 0) {
-        // Non-blocking: return the cached audio when ready, otherwise join the
-        // background harvest and report its live status as text.
+        // Non-blocking: return the captured preview as MP3 bytes when ready,
+        // otherwise join the background harvest and report live status as text.
         const results = await Promise.all(
           readyClips.map(async (clip) => {
             const id = String(clip.id);
             try {
-              const cached = await opts.api!.getCachedPreview(id);
+              const cached = await opts.api!.getCachedPreviewMp3(id);
               if (cached) return [id, cached] as const;
               opts.api!.beginPreviewHarvest(id);
               return [id, { job: opts.api!.previewJobStatus(id) }] as const;

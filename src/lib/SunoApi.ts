@@ -50,6 +50,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { emitPreviewLiveEvent } from '@/lib/preview-live/preview-live-events';
 import { DEFAULT_MODEL } from '@/lib/suno-models';
+import { ensurePreviewMp3, isMp3Buffer, PREVIEW_MP3_MIME } from '@/lib/preview-mp3';
 
 export { DEFAULT_MODEL };
 
@@ -137,6 +138,7 @@ const globalForHarvest = global as unknown as {
   sunoPreviewCacheIndex?: Set<string>;
   sunoPreviewCacheIndexLoaded?: boolean;
   sunoPreviewCacheIndexPromise?: Promise<void>;
+  sunoPreviewMp3?: Map<string, Promise<{ buffer: Buffer; contentType: string; transcoded: boolean } | null>>;
 };
 const harvestLocks = globalForHarvest.sunoAudioHarvest || new Map<string, Promise<Buffer>>();
 globalForHarvest.sunoAudioHarvest = harvestLocks;
@@ -148,6 +150,8 @@ if (!globalForHarvest.sunoPlaywrightHarvest)
   globalForHarvest.sunoPlaywrightHarvest = Promise.resolve();
 const previewCacheIndex = globalForHarvest.sunoPreviewCacheIndex || new Set<string>();
 globalForHarvest.sunoPreviewCacheIndex = previewCacheIndex;
+const previewMp3Locks = globalForHarvest.sunoPreviewMp3 || new Map<string, Promise<{ buffer: Buffer; contentType: string; transcoded: boolean } | null>>();
+globalForHarvest.sunoPreviewMp3 = previewMp3Locks;
 
 export class ClipAudioNotReadyError extends Error {
   statusCode = 409;
@@ -192,6 +196,10 @@ function audioCachePath(clipId: string): string {
 
 function previewCachePath(clipId: string): string {
   return path.join(PREVIEW_CACHE_DIR, `${clipId}.bin`);
+}
+
+function previewMp3CachePath(clipId: string): string {
+  return path.join(PREVIEW_CACHE_DIR, `${clipId}.mp3.bin`);
 }
 
 function waitMs(ms: number): Promise<void> {
@@ -2604,6 +2612,41 @@ class SunoApi {
     return this.readPreviewResult(clipId);
   }
 
+  /**
+   * Return an already-captured preview as MP3 bytes for MCP embedding.
+   * Null when nothing has been captured yet (same contract as
+   * getCachedPreview). MP3 sources pass through; other containers are
+   * transcoded once per clip (disk sidecar) and concurrent callers share
+   * one transcode. Transcode failure falls back to the original bytes so
+   * callers can still serve a playable preview.
+   */
+  public async getCachedPreviewMp3(
+    clipId: string
+  ): Promise<{ buffer: Buffer; contentType: string; transcoded: boolean } | null> {
+    let pending = previewMp3Locks.get(clipId);
+    if (!pending) {
+      pending = (async () => {
+        const mp3Sidecar = await this.readPreviewMp3Cache(clipId);
+        if (mp3Sidecar) return { ...mp3Sidecar, transcoded: true };
+        const cached = await this.getCachedPreview(clipId);
+        if (!cached) return null;
+        if (cached.contentType === PREVIEW_MP3_MIME || isMp3Buffer(cached.buffer)) {
+          return { buffer: cached.buffer, contentType: PREVIEW_MP3_MIME, transcoded: false };
+        }
+        const mp3 = await ensurePreviewMp3(cached.buffer, cached.contentType);
+        if (mp3.transcoded) await this.writePreviewMp3Cache(clipId, mp3.buffer);
+        return mp3;
+      })();
+      previewMp3Locks.set(clipId, pending);
+    }
+    try {
+      return await pending;
+    } finally {
+      if (previewMp3Locks.get(clipId) === pending)
+        previewMp3Locks.delete(clipId);
+    }
+  }
+
   /** Cheap ready check for the live deck; does not read the audio bytes. */
   public hasCachedPreview(clipId: string): boolean {
     const entry = previewResults.get(clipId);
@@ -2618,6 +2661,8 @@ class SunoApi {
         try {
           const names = await fs.readdir(PREVIEW_CACHE_DIR);
           for (const name of names) {
+            // Transcoded sidecars (*.mp3.bin) are derived artifacts, not base captures.
+            if (name.endsWith('.mp3.bin')) continue;
             if (name.endsWith('.bin')) previewCacheIndex.add(name.slice(0, -'.bin'.length));
           }
         } catch {
@@ -2943,6 +2988,34 @@ class SunoApi {
     await fs.writeFile(tmp, buffer);
     await fs.rename(tmp, dest);
     previewCacheIndex.add(clipId);
+    // The base bytes changed: a previously transcoded sidecar would now be stale.
+    try {
+      await fs.unlink(previewMp3CachePath(clipId));
+    } catch {
+      // No sidecar yet — nothing stale to drop.
+    }
+  }
+
+  private async readPreviewMp3Cache(clipId: string): Promise<{ buffer: Buffer; contentType: string } | null> {
+    try {
+      const buffer = await fs.readFile(previewMp3CachePath(clipId));
+      if (!isMp3Buffer(buffer)) return null;
+      return { buffer, contentType: PREVIEW_MP3_MIME };
+    } catch {
+      return null;
+    }
+  }
+
+  private async writePreviewMp3Cache(clipId: string, buffer: Buffer): Promise<void> {
+    try {
+      await fs.mkdir(PREVIEW_CACHE_DIR, { recursive: true });
+      const dest = previewMp3CachePath(clipId);
+      const tmp = dest + '.tmp';
+      await fs.writeFile(tmp, buffer);
+      await fs.rename(tmp, dest);
+    } catch {
+      // Best-effort sidecar: a failed write only costs a re-transcode next time.
+    }
   }
 
   /**

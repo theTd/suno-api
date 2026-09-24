@@ -629,7 +629,7 @@ export function createMcpServer(): McpServer {
     {
       title: "Get Audio Info",
       description:
-        "Retrieve audio information by clip IDs or list recent clips by page.",
+        "Retrieve audio information by clip IDs or list recent clips by page. Each returned page is sorted newest-first by created_at.",
       inputSchema: {
         ids: z.array(z.string()).optional().describe("Array of audio clip IDs to fetch"),
         page: z.string().optional().describe("Page number for paginated listing"),

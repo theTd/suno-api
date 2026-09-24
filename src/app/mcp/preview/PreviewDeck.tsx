@@ -65,18 +65,29 @@ function mergeClip(old: TrackView | undefined, incoming: TrackView): TrackView {
   };
 }
 
-/** 第一页是最新窗口：放在列表头；已加载的更旧页接到后面，避免 page1 推送冲掉翻页结果。 */
+/** 第一页是最新窗口：放在列表头；已加载的更旧页接到后面，避免 page1 推送冲掉翻页结果。最终按 createdAt 倒序。 */
 function mergePage1(prev: TrackView[], fresh: TrackView[]): TrackView[] {
   const prevById = new Map(prev.map((t) => [t.id, t]));
   const freshIds = new Set(fresh.map((t) => t.id));
   const head = fresh.map((t) => mergeClip(prevById.get(t.id), t));
   const tail = prev.filter((t) => !freshIds.has(t.id));
-  return [...head, ...tail];
+  return sortTracksNewest([...head, ...tail]);
 }
 
 function sameIdSet(ids: string[], set: Set<string>): boolean {
   if (ids.length !== set.size) return false;
   return ids.every((id) => set.has(id));
+}
+
+/** Strict newest-first (`createdAt` desc, missing = oldest), same rule as Suno Library. */
+function trackCreatedAtMs(value: unknown): number {
+  if (typeof value !== 'string' || value.length === 0) return 0;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function sortTracksNewest(tracks: TrackView[]): TrackView[] {
+  return tracks.sort((a, b) => trackCreatedAtMs(b.createdAt) - trackCreatedAtMs(a.createdAt));
 }
 
 function applyPreviewStatus(
@@ -207,7 +218,10 @@ export default function PreviewDeck() {
       setTracks((prev) => prev.map((t) => (t.id === msg.clipId ? applyPreviewStatus(t, msg) : t)));
     },
     onClipStatus: (msg) => {
-      setTracks((prev) => prev.map((t) => (t.id === msg.clipId ? applyClipStatus(t, msg) : t)));
+      // createdAt 可能随状态到达/修正：保持严格 newest 排序。
+      setTracks((prev) =>
+        sortTracksNewest(prev.map((t) => (t.id === msg.clipId ? applyClipStatus(t, msg) : t)))
+      );
     },
     onUnlockStatus: (msg) => {
       setTracks((prev) =>
@@ -261,7 +275,7 @@ export default function PreviewDeck() {
       setTracks((prev) => {
         const seenNow = new Set(prev.map((t) => t.id));
         const next = page.filter((t) => !seenNow.has(t.id));
-        return next.length ? [...prev, ...next] : prev;
+        return next.length ? sortTracksNewest([...prev, ...next]) : prev;
       });
       if (sameAsPage1 || sameAsLast) {
         // page 参数被忽略，或服务端把末页原样重复返回

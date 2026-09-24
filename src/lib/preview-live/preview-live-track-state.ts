@@ -17,6 +17,17 @@ function isPreviewableStatus(status: string): boolean {
   return status === 'complete' || status === 'streaming';
 }
 
+function createdAtMs(value: unknown): number {
+  if (typeof value !== 'string' || value.length === 0) return 0;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+/** Strict newest-first (`createdAt` desc) so WS pages agree with Library. */
+export function comparePreviewTrackNewest(a: PreviewTrack, b: PreviewTrack): number {
+  return createdAtMs(b.createdAt) - createdAtMs(a.createdAt);
+}
+
 export function previewStateFromJob(state: PreviewJobSnapshot['state']): PreviewState {
   switch (state) {
     case 'capturing':
@@ -75,5 +86,5 @@ export function clipToPreviewTrack(clip: AudioInfo, api: PreviewTrackLookup): Pr
 }
 
 export function clipsToPreviewTracks(clips: AudioInfo[], api: PreviewTrackLookup): PreviewTrack[] {
-  return clips.map((clip) => clipToPreviewTrack(clip, api));
+  return clips.map((clip) => clipToPreviewTrack(clip, api)).sort(comparePreviewTrackNewest);
 }

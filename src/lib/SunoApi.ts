@@ -76,6 +76,17 @@ const PREVIEW_RESULT_TTL_MS = 10 * 60 * 1000;
 const KEEPALIVE_RENEW_SKEW_MS = 15 * 1000;
 /** Feed listing (`get()` without ids): short TTL coalesces HTTP / MCP callers. The preview-live watch uses `{ fresh: true }`. */
 const FEED_LIST_TTL_MS = 10 * 1000;
+/** Missing/unparseable `created_at` sorts as oldest so newest-first never crashes on partial clips. */
+function createdAtMs(value: unknown): number {
+  if (typeof value !== 'string' || value.length === 0) return 0;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+/** Strict newest-first (`created_at` desc). Stable for equal/missing timestamps. */
+export function compareAudioInfoNewest(a: AudioInfo, b: AudioInfo): number {
+  return createdAtMs(b.created_at) - createdAtMs(a.created_at);
+}
 /** After the widget passes, wait this long for Suno to auto-submit generate/v2. */
 const POST_CAPTCHA_AUTOSUBMIT_MS = 2500;
 /** After a post-pass Create click, wait this long for /api/generate/v2 to hit the intercept. */
@@ -2527,6 +2538,9 @@ class SunoApi {
     });
     this.feedInflight.set(key, promise);
     const data = await promise;
+    // /api/feed/v2 returns a feed window, not strict newest-first: sort every
+    // listing (ids + paginated) by created_at desc so MCP + preview agree with Library.
+    data.sort(compareAudioInfoNewest);
     if (listMode && epoch === this.feedListEpoch) {
       this.feedListCache = { key, at: Date.now(), data };
     }

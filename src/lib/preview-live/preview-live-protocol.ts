@@ -15,6 +15,8 @@ export interface PreviewTrack {
   id: string;
   title: string;
   status: string;
+  /** Song vs SFX, resolved server-side via clipKind(). */
+  kind: 'song' | 'sound';
   createdAt?: string;
   preview: PreviewState;
   progressPercent: number | null;

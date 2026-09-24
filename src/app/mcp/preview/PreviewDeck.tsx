@@ -581,6 +581,15 @@ export default function PreviewDeck() {
                     <span className={`shrink-0 rounded-full border px-2.5 py-1 text-xs ${badgeClass(t.preview)}`}>
                       {PREVIEW_LABEL[t.preview]}
                     </span>
+                    {t.kind === 'sound' ? (
+                      <span className="shrink-0 rounded-full border border-amber-500/40 px-2.5 py-1 text-xs text-amber-200">
+                        SOUND
+                      </span>
+                    ) : (
+                      <span className="shrink-0 rounded-full border border-zinc-700 px-2.5 py-1 text-xs text-zinc-400">
+                        SONG
+                      </span>
+                    )}
                   </button>
                   <button
                     type="button"

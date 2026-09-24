@@ -4,7 +4,7 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerRequest, ServerNotification } from "@modelcontextprotocol/sdk/types.js";
 import { InMemoryTaskStore, InMemoryTaskMessageQueue } from "@modelcontextprotocol/sdk/experimental/tasks/stores/in-memory.js";
 import { z } from "zod/v4";
-import { ClipAudioNotReadyError, DEFAULT_MODEL, isUnusableAudioUrl, rewriteForbiddenAudioUrls, sunoApi } from "./SunoApi";
+import { ClipAudioNotReadyError, DEFAULT_MODEL, clipKind, isUnusableAudioUrl, rewriteForbiddenAudioUrls, sunoApi } from "./SunoApi";
 import type { PreviewJobSnapshot } from "./SunoApi";
 import { parseGenerationExtras, SOUND_KEY_HINT, SOUND_KEY_PATTERN } from "./generation-options";
 import { listSunoModels } from "./suno-models";
@@ -46,6 +46,8 @@ function clipMetaText(clip: any): string {
     id,
     title: clip.title,
     status: clip.status,
+    kind: clipKind(clip),
+    model_name: clip.model_name,
     duration: clip.duration,
     audio_url: clip.audio_url,
     unlocked: id ? hasUnlockConsent(id) : false,
@@ -234,7 +236,7 @@ async function buildToolResult(
       }
       return {
         content,
-        structuredContent: { clips },
+        structuredContent: { clips: clips.map((clip) => ({ ...clip, kind: clipKind(clip) })) },
         isError: false,
       };
     }
@@ -629,7 +631,7 @@ export function createMcpServer(): McpServer {
     {
       title: "Get Audio Info",
       description:
-        "Retrieve audio information by clip IDs or list recent clips by page. Each returned page is sorted newest-first by created_at.",
+        "Retrieve audio information by clip IDs or list recent clips by page. Each returned page is sorted newest-first by created_at. Each clip includes kind (song vs sound) and model_name.",
       inputSchema: {
         ids: z.array(z.string()).optional().describe("Array of audio clip IDs to fetch"),
         page: z.string().optional().describe("Page number for paginated listing"),

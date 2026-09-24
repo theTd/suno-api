@@ -88,6 +88,24 @@ function createdAtMs(value: unknown): number {
 export function compareAudioInfoNewest(a: AudioInfo, b: AudioInfo): number {
   return createdAtMs(b.created_at) - createdAtMs(a.created_at);
 }
+
+/**
+ * Music vs SFX discriminator. `metadata.type` is 'gen' for both, so it cannot
+ * be used (it is only passed through on AudioInfo.type, never for decisions);
+ * Suno marks SFX with `metadata.task === 'sound'` (music uses tasks
+ * like 'agentic_thinking') and `model_name === 'chirp-sfx'`, which is also
+ * what drives the website's SOUND badge (`metadata.secondary_badges`).
+ * Matching is case-insensitive; unknown/missing signals fall back to 'song'.
+ */
+export function clipKind(clip: {
+  task?: unknown;
+  model_name?: unknown;
+}): 'sound' | 'song' {
+  const task = typeof clip.task === 'string' ? clip.task.toLowerCase() : '';
+  const model = typeof clip.model_name === 'string' ? clip.model_name.toLowerCase() : '';
+  if (task === 'sound' || model === 'chirp-sfx') return 'sound';
+  return 'song';
+}
 /** After the widget passes, wait this long for Suno to auto-submit generate/v2. */
 const POST_CAPTCHA_AUTOSUBMIT_MS = 2500;
 /** After a post-pass Create click, wait this long for /api/generate/v2 to hit the intercept. */
@@ -252,6 +270,8 @@ export interface AudioInfo {
   prompt?: string; // Prompt for audio generation
   status: string; // Status
   type?: string;
+  /** Raw Suno generation task (e.g. 'sound' for SFX). See clipKind(). */
+  task?: string;
   tags?: string; // Genre of music.
   negative_tags?: string; // Negative tags of music.
   duration?: string; // Duration of the audio
@@ -2249,6 +2269,7 @@ class SunoApi {
       gpt_description_prompt: audio.metadata.gpt_description_prompt,
       prompt: audio.metadata.prompt,
       type: audio.metadata.type,
+      task: audio.metadata.task,
       tags: audio.metadata.tags,
       negative_tags: audio.metadata.negative_tags,
       duration: audio.metadata.duration
@@ -2535,6 +2556,7 @@ class SunoApi {
         gpt_description_prompt: audio.metadata.gpt_description_prompt,
         prompt: audio.metadata.prompt,
         type: audio.metadata.type,
+        task: audio.metadata.task,
         tags: audio.metadata.tags,
         duration: audio.metadata.duration,
         error_message: audio.metadata.error_message

@@ -1,4 +1,5 @@
 import type { AudioInfo, PreviewJobSnapshot } from '@/lib/SunoApi';
+import { clipKind } from '@/lib/SunoApi';
 import type { PreviewState, PreviewTrack } from '@/lib/preview-live/preview-live-protocol';
 import { hasUnlockConsent } from '@/lib/unlock-consent';
 
@@ -74,6 +75,7 @@ export function clipToPreviewTrack(clip: AudioInfo, api: PreviewTrackLookup): Pr
     id,
     title: clip.title || id,
     status,
+    kind: clipKind(clip),
     createdAt: clip.created_at ? String(clip.created_at) : undefined,
     preview,
     progressPercent,

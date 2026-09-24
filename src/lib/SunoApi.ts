@@ -224,9 +224,67 @@ function waitMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * 给无超时的 page.evaluate 加上限：导航中挂起的 CDP 调用只会拖慢
+ * 本轮循环，不会卡死整单抓取。超时后底层的 evaluate 仍在后台，
+ * 由 page.close() 统一回收。
+ */
+function withEvalTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`evaluate timed out after ${ms}ms`)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /** PNG IHDR width/height without pulling in an image library. */
 function pngSize(buf: Buffer): { width: number; height: number } {
   return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+}
+
+/**
+ * Preview 池的 MSE 偷录钩子（page.evaluate 内运行，必须保持无闭包）。
+ * 在池创建时随 context 安装一次，所有复用 page 共享，不随抓取叠加。
+ *
+ * 反 Tamper 注意（2026-09 实测）：Suno 播放器会探测钩子标记，
+ * `window` 上可枚举的 `__sunoMse` 会触发回退到 forbidden 占位直链
+ * （404，真流永远不加载）；改为不可枚举属性后恢复正常。
+ * 如未来再被探测，备选是网络层旁观（response.body）而非原型补丁。
+ */
+function installPreviewMseHook(): void {
+  Object.defineProperty(window as any, '__sunoMse', {
+    value: { chunks: [] as number[][], bytes: 0, hooked: false },
+    writable: true,
+    configurable: true,
+    enumerable: false
+  });
+  const hook = () => {
+    const store = (window as any).__sunoMse;
+    if (!store || store.hooked || !(window as any).MediaSource) return;
+    store.hooked = true;
+    const origAdd = MediaSource.prototype.addSourceBuffer;
+    MediaSource.prototype.addSourceBuffer = function (mime: string) {
+      const sb = origAdd.call(this, mime);
+      if (!/audio/i.test(mime || '')) return sb;
+      const origAppend = sb.appendBuffer;
+      sb.appendBuffer = function (data: BufferSource) {
+        try {
+          const src = data instanceof ArrayBuffer
+            ? new Uint8Array(data)
+            : new Uint8Array((data as Uint8Array).buffer, (data as Uint8Array).byteOffset, (data as Uint8Array).byteLength);
+          store.chunks.push(Array.from(src));
+          store.bytes += src.length;
+        } catch {
+          // ignore copy failures; still append
+        }
+        return origAppend.call(this, data);
+      };
+      return sb;
+    };
+  };
+  hook();
+  document.addEventListener('DOMContentLoaded', hook);
 }
 
 /**
@@ -1065,7 +1123,10 @@ class SunoApi {
       '--no-sandbox',
       '--disable-dev-shm-usage',
       '--disable-extensions',
-      '--disable-features=ThirdPartyCookiePhaseout,TrackingProtection3pcd'
+      '--disable-features=ThirdPartyCookiePhaseout,TrackingProtection3pcd',
+      // 无头抓取没有用户手势：允许程序化 play()，否则 Suno 播放器起不来
+      // （实测 headless 下缺此开关 capture 永远等不到首帧）。
+      '--autoplay-policy=no-user-gesture-required'
     ];
     // Check for GPU acceleration, as it is recommended to turn it off for Docker
     if (yn(process.env.BROWSER_DISABLE_GPU, { default: false }))
@@ -1420,8 +1481,7 @@ class SunoApi {
    * Close a browser with a hard cap: a wedged renderer can make CDP close calls
    * hang forever, which would leak the chromium process and the caller's request.
    */
-  private async disposeBrowser(browser: Browser, context: BrowserContext): Promise<void> {
-    const proc = (browser as any).process?.() as { kill: (signal: string) => void } | null;
+  private async disposeBrowser(browser: Browser, context: BrowserContext): Promise<void> {    const proc = (browser as any).process?.() as { kill: (signal: string) => void } | null;
     let closed = false;
     await Promise.race([
       (async () => {
@@ -1439,6 +1499,94 @@ class SunoApi {
         }
       })
     ]).catch(() => {});
+  }
+
+  /**
+   * Preview capture browser pool: preview harvests reuse one persistent
+   * browser+context (new page per capture) instead of launch/dispose per
+   * clip. A cold launch + teardown costs ~5-10s per click; reuse cuts the
+   * second consecutive preview down to page-load + playback only.
+   * Separate from browserSession (captcha/generate) to avoid lock coupling.
+   * Idle TTL avoids a stale-cookie/RAM leak when nobody previews.
+   */
+  private previewBrowser?: Browser;
+  private previewBrowserContext?: BrowserContext;
+  private previewBrowserIdleTimer?: ReturnType<typeof setTimeout>;
+  private previewBrowserInflight?: Promise<{ browser: Browser; context: BrowserContext }>;
+
+  private previewBrowserIdleTtlMs(): number {
+    const raw = Number(process.env.PREVIEW_BROWSER_IDLE_MS || 5 * 60 * 1000);
+    if (!Number.isFinite(raw) || raw <= 0) return 5 * 60 * 1000;
+    return Math.min(30 * 60 * 1000, Math.floor(raw));
+  }
+
+  private touchPreviewBrowserIdle(): void {
+    if (this.previewBrowserIdleTimer) clearTimeout(this.previewBrowserIdleTimer);
+    this.previewBrowserIdleTimer = setTimeout(() => {
+      this.previewBrowserIdleTimer = undefined;
+      void this.discardPreviewBrowser('idle timeout');
+    }, this.previewBrowserIdleTtlMs());
+    this.previewBrowserIdleTimer.unref?.();
+  }
+
+  private previewBrowserAlive(): boolean {
+    const browser = this.previewBrowser;
+    const context = this.previewBrowserContext;
+    if (!browser || !context) return false;
+    try {
+      return browser.isConnected();
+    } catch {
+      return false;
+    }
+  }
+
+  private async ensurePreviewBrowser(): Promise<{ browser: Browser; context: BrowserContext }> {
+    if (this.previewBrowserInflight) return this.previewBrowserInflight;
+    if (this.previewBrowserAlive())
+      return { browser: this.previewBrowser!, context: this.previewBrowserContext! };
+    const run = (async () => {
+      // Double-check after awaiting: a racing caller may have filled it.
+      if (this.previewBrowserAlive())
+        return { browser: this.previewBrowser!, context: this.previewBrowserContext! };
+      logger.info('Launching preview browser (reused across captures)...');
+      const { browser, context } = await this.launchBrowser();
+      await context.addInitScript(installPreviewMseHook);
+      this.previewBrowser = browser;
+      this.previewBrowserContext = context;
+      browser.on('disconnected', () => {
+        if (this.previewBrowser === browser) {
+          logger.info('Preview browser disconnected');
+          this.previewBrowser = undefined;
+          this.previewBrowserContext = undefined;
+        }
+      });
+      return { browser, context };
+    })();
+    this.previewBrowserInflight = run;
+    try {
+      const result = await run;
+      this.touchPreviewBrowserIdle();
+      return result;
+    } catch (err) {
+      await this.discardPreviewBrowser('launch failed');
+      throw err;
+    } finally {
+      if (this.previewBrowserInflight === run) this.previewBrowserInflight = undefined;
+    }
+  }
+
+  private async discardPreviewBrowser(reason: string): Promise<void> {
+    if (this.previewBrowserIdleTimer) {
+      clearTimeout(this.previewBrowserIdleTimer);
+      this.previewBrowserIdleTimer = undefined;
+    }
+    const browser = this.previewBrowser;
+    const context = this.previewBrowserContext;
+    this.previewBrowser = undefined;
+    this.previewBrowserContext = undefined;
+    if (!browser) return;
+    logger.info('Discarding preview browser: ' + reason);
+    await this.disposeBrowser(browser, context!).catch(() => {});
   }
 
   /**
@@ -3140,56 +3288,59 @@ class SunoApi {
     clipDurationSec?: number,
     job?: PreviewJob
   ): Promise<Buffer> {
-    const { browser, context } = await this.launchBrowser();
+    const { context } = await this.ensurePreviewBrowser();
+    // 池化 context 的 cookie 会过期：每次抓取前用内存里最新的
+    // keepAlive 会话重注，避免落到 /auth/session-recovery 空转
+    // （实测过期会话恢复要 20s+，且真流不加载）。
+    await this.keepAlive(false).catch(() => {});
+    await context
+      .addCookies(sunoCookieInjectList(this.cookies, this.currentToken))
+      .catch(() => {});
+    const page = await context.newPage();
     try {
-      await context.addInitScript(() => {
-        (window as any).__sunoMse = { chunks: [] as number[][], bytes: 0, hooked: false };
-        const hook = () => {
-          const store = (window as any).__sunoMse;
-          if (!store || store.hooked || !(window as any).MediaSource) return;
-          store.hooked = true;
-          const origAdd = MediaSource.prototype.addSourceBuffer;
-          MediaSource.prototype.addSourceBuffer = function (mime: string) {
-            const sb = origAdd.call(this, mime);
-            if (!/audio/i.test(mime || '')) return sb;
-            const origAppend = sb.appendBuffer;
-            sb.appendBuffer = function (data: BufferSource) {
-              try {
-                const src = data instanceof ArrayBuffer
-                  ? new Uint8Array(data)
-                  : new Uint8Array((data as Uint8Array).buffer, (data as Uint8Array).byteOffset, (data as Uint8Array).byteLength);
-                store.chunks.push(Array.from(src));
-                store.bytes += src.length;
-              } catch {
-                // ignore copy failures; still append
-              }
-              return origAppend.call(this, data);
-            };
-            return sb;
-          };
-        };
-        hook();
-        document.addEventListener('DOMContentLoaded', hook);
-      });
-      const page = await context.newPage();
       await applyChromiumUserAgentOverride(page, this.fingerprint);
       await page.goto(`https://suno.com/song/${clipId}`, {
         referer: 'https://suno.com/',
         waitUntil: 'domcontentloaded',
         timeout: 20000
       });
+      // 过期会话会被踢到 session-recovery：等它跳回歌页再点，
+      // 否则 Edit 等待过期、点击全打空，真流永远不加载。
+      await page
+        .waitForURL(/suno\.com\/song\//, { timeout: 45000 })
+        .catch(() => {});
       await this.dismissOverlays(page);
-      await page.getByRole('button', { name: 'Edit', exact: true }).waitFor({ timeout: 20000 }).catch(() => {});
+      const editSeen = await page
+        .getByRole('button', { name: 'Edit', exact: true })
+        .waitFor({ timeout: 20000 })
+        .then(() => true)
+        .catch(() => false);
       await this.dismissOverlays(page);
+      if (!editSeen) {
+        // Edit 未出现才等网络静默（横幅点击/恢复跳转会引起重载）：
+        // evaluate 在导航中可能永久挂起，无超时即卡死整单抓取。
+        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      }
+      logger.info({ clipId, url: page.url(), editSeen }, 'Preview page ready');
 
-      const startedPlayback = await page.evaluate(async () => {
+      const startedPlayback = await withEvalTimeout(page.evaluate(() => {
         const media = [...document.querySelectorAll('audio, video')] as HTMLMediaElement[];
         for (const a of media) {
-          try { await a.play(); } catch { /* autoplay may be blocked until a gesture */ }
+          // 只发射不等待：await a.play() 会在流未就绪时永久挂起，
+          // 连带整个 evaluate 超时；是否起播由轮询判定。
+          try { void a.play().catch(() => {}); } catch { /* autoplay may be blocked until a gesture */ }
         }
-        return media.some((a) => !a.paused);
-      }).catch(() => false);
-      if (!startedPlayback) {
+        // 占位静音（sil-）空转不算起播，避免跳过真正的播放点击。
+        const real = media.filter(
+          (a) => !String(a.currentSrc || a.src || '').includes('sil-')
+        );
+        return {
+          count: media.length,
+          started: real.some((a) => !a.paused && a.currentTime > 0.2)
+        };
+      }), 15000).catch(() => ({ count: -1, started: false }));
+      logger.info({ clipId, ...startedPlayback }, 'Preview playback attempt');
+      if (!startedPlayback.started) {
         await page.getByRole('button', { name: /play/i }).first().click({ timeout: 5000 }).catch(() => {});
         await page.keyboard.press('Space').catch(() => {});
       }
@@ -3197,23 +3348,36 @@ class SunoApi {
       const targetSec = clipDurationSec && clipDurationSec > 0 ? clipDurationSec : 20;
       const deadline = Date.now() + Math.min(PREVIEW_CAPTURE_MAX_MS, targetSec * 1000 + 60000);
       const collected: Buffer[] = [];
-      let playback: { t: number; d: number; ended: boolean; paused: boolean; bytes: number } | null = null;
+      let playback: { t: number; d: number; ended: boolean; paused: boolean; bytes: number; src: string } | null = null;
+      // 播放器有时不用 MSE 而用直链 src（此时钩子抓不到字节）：
+      // 记下播起来的 http(s) 地址，兜底整包拉取。
+      let httpSrc: string | null = null;
+      // 占位静音（sil-）空转不算起播；长时间无真实进度则补点播放键。
+      let lastReclickAt = 0;
+      let reclicks = 0;
       while (Date.now() < deadline) {
-        playback = await page.evaluate(() => {
+        playback = await withEvalTimeout(page.evaluate(() => {
           const store = (window as any).__sunoMse;
           const media = [...document.querySelectorAll('audio, video')] as HTMLMediaElement[];
-          const a = media.find((el) => el.currentTime > 0 || !el.paused) || media[0];
+          const isPlaceholder = (el: HTMLMediaElement) =>
+            String(el.currentSrc || el.src || '').includes('sil-');
+          const a =
+            media.find((el) => el.currentTime > 0.2 && !isPlaceholder(el)) ||
+            media.find((el) => !el.paused && !isPlaceholder(el)) ||
+            media[0];
+          const src = a ? String(a.currentSrc || a.src || '') : '';
           return {
             t: a ? a.currentTime : 0,
             d: a && Number.isFinite(a.duration) ? a.duration : 0,
             ended: !!(a && a.ended),
             paused: !a || a.paused,
-            bytes: store?.bytes || 0
+            bytes: store?.bytes || 0,
+            src: src.slice(0, 120)
           };
-        }).catch(() => null);
+        }), 10000).catch(() => null);
         // Incremental drain: push freshly appended MSE chunks to progressive
         // stream subscribers while playback is still running.
-        const drained = await page.evaluate(drainMseChunkPayload).catch(() => null);
+        const drained = await withEvalTimeout(page.evaluate(drainMseChunkPayload), 10000).catch(() => null);
         if (drained && drained.total > 0) {
           const chunk = Buffer.from(drained.b64, 'base64');
           collected.push(chunk);
@@ -3226,24 +3390,78 @@ class SunoApi {
           job.currentSec = playback.t;
           if (playback.d > 0) job.durationSec = playback.d;
           job.bytes = playback.bytes;
+          if (
+            !httpSrc &&
+            playback.t > 0.2 &&
+            /^https?:\/\//i.test(playback.src) &&
+            !playback.src.includes('/api/forbidden')
+          )
+            httpSrc = playback.src;
           this.emitPreviewJob(clipId);
         }
         if (playback && playback.t > 0.2 && playback.paused)
-          await page.evaluate(async () => {
+          await withEvalTimeout(page.evaluate(() => {
             for (const a of document.querySelectorAll('audio, video') as NodeListOf<HTMLMediaElement>) {
-              try { await a.play(); } catch {}
+              try { void a.play().catch(() => {}); } catch {}
             }
-          }).catch(() => {});
+          }), 10000).catch(() => {});
+        // 长时间无真实进度（占位空转/点击打空）：补点一次播放键，最多 4 次。
+        // 播放键可能点到 decoy，每次补点后给页面几秒反应时间。
+        if (
+          playback &&
+          playback.t <= 0.2 &&
+          playback.bytes <= 0 &&
+          reclicks < 4 &&
+          Date.now() - lastReclickAt > 15000
+        ) {
+          reclicks += 1;
+          lastReclickAt = Date.now();
+          logger.info({ clipId, reclicks }, 'Preview reclicking play (no real progress)');
+          await page.getByRole('button', { name: /play/i }).first().click({ timeout: 5000 }).catch(() => {});
+          await page.keyboard.press('Space').catch(() => {});
+        }
         if (playback && playback.bytes > 3000 && (playback.ended || playback.t >= targetSec * 0.9))
           break;
         await waitMs(500);
       }
-      if (!playback || playback.t < 0.2 || playback.bytes < 3000)
-        throw new Error('Preview playback never started or captured too little audio');
-      if (!playback.ended && playback.t < targetSec * 0.9)
+      if (!playback || playback.t < 0.2 || playback.bytes < 3000) {
+        // 直链 src 播完但 MSE 钩子无字节：页内整包拉取同 URL（带登录态），
+        // 避免整单失败。仍无结果才按原语义抛错。
+        if (httpSrc && playback && playback.t > 0.2) {
+          logger.info({ clipId, httpSrc: httpSrc.slice(0, 120) }, 'Preview falling back to in-page fetch');
+          const fetched = await withEvalTimeout(
+            page.evaluate(async (url: string) => {
+              const resp = await fetch(url, { credentials: 'include' });
+              if (!resp.ok) return null;
+              const buf = new Uint8Array(await resp.arrayBuffer());
+              let bin = '';
+              for (let i = 0; i < buf.length; i += 0x8000)
+                bin += String.fromCharCode.apply(null, Array.from(buf.subarray(i, i + 0x8000)));
+              return { total: buf.length, b64: btoa(bin) };
+            }, httpSrc),
+            60000
+          ).catch(() => null);
+          if (fetched && fetched.total > 3000) {
+            const chunk = Buffer.from(fetched.b64, 'base64');
+            // 整包与零散 MSE 前缀混拼会坏容器：不足 3KB 的前缀直接丢弃
+            collected.length = 0;
+            collected.push(chunk);
+            if (job) {
+              job.chunkLog.push(chunk);
+              this.emitPreviewChunk(job, chunk, job.chunkLog.length - 1);
+            }
+          }
+        }
+      }
+      if (!playback || playback.t < 0.2 || playback.bytes < 3000) {
+        const fetchedBytes = collected.reduce((s, c) => s + c.length, 0);
+        if (fetchedBytes < 3000)
+          throw new Error('Preview playback never started or captured too little audio');
+      }
+      if (playback && !playback.ended && playback.t < targetSec * 0.9)
         throw new Error('Preview capture stopped before end of listen window');
 
-      const packed = await page.evaluate(drainMseChunkPayload).catch(() => null);
+      const packed = await withEvalTimeout(page.evaluate(drainMseChunkPayload), 10000).catch(() => null);
       if (packed && packed.total > 0) {
         const chunk = Buffer.from(packed.b64, 'base64');
         collected.push(chunk);
@@ -3255,9 +3473,16 @@ class SunoApi {
       const buffer = Buffer.concat(collected);
       if (!looksLikeAudio(buffer))
         throw new Error('Preview capture did not produce playable audio');
+      this.touchPreviewBrowserIdle();
       return buffer;
+    } catch (err) {
+      // 抓取失败后无条件丢掉池浏览器：一个外表 connected、实则已坏
+      // （渲染会话崩、CDP 死锁）的复用实例会毒化之后所有抓取；
+      // 重开一次约几秒，远比连续失败便宜。
+      await this.discardPreviewBrowser('capture error');
+      throw err;
     } finally {
-      await this.disposeBrowser(browser, context);
+      await page.close().catch(() => {});
     }
   }
 
